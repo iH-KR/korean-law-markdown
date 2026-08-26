@@ -1,0 +1,33 @@
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+.venv/
+
+# Local input data
+law_targets.csv
+*_backup.csv
+*.legacy.csv
+
+# Generated output and Python cache
+output/
+__pycache__/
+*.py[cod]
+
+# IDE and agent-specific settings
+.idea/
+.vscode/
+.claude/
+.codex/
+.codex_tmp*/
+.junie/
+
+# Private or project-specific utilities retained locally
+NFSC_history_add.py
+list_of_NFPC_NFTC.csv
+
+# Temporary and local validation artifacts
+*.bak
+*.tmp
+*.log
+*.zip
