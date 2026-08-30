@@ -50,11 +50,13 @@ import os
 import re
 import sys
 import time
+import unicodedata
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import quote, quote_plus, urlencode
 
 import pandas as pd
 import requests
@@ -146,7 +148,51 @@ FAILED_COLUMNS = [
 # ---------------------------------------------------------------------------
 # 로깅 / 터미널 출력
 # ---------------------------------------------------------------------------
-class CompactConsoleFormatter(logging.Formatter):
+_SENSITIVE_VALUES: set[str] = set()
+_OC_QUERY_RE = re.compile(
+    r"(?i)(\bOC(?:=|%3D))([^&\s\"'<>]+)"
+)
+
+
+def _register_sensitive_value(value: str) -> None:
+    """로그/결과표에서 삭제해야 할 인증값을 등록한다."""
+    secret = (value or "").strip()
+    if not secret:
+        return
+    _SENSITIVE_VALUES.update({
+        secret,
+        quote(secret, safe=""),
+        quote_plus(secret, safe=""),
+    })
+
+
+def redact_sensitive(value: Any) -> str:
+    """OC 쿼리 값과 현재 실행의 LAW_OC 값을 중앙 마스킹한다."""
+    if value is None:
+        return ""
+    text = str(value)
+    for secret in sorted(_SENSITIVE_VALUES, key=len, reverse=True):
+        if secret:
+            text = text.replace(secret, "{LAW_OC}")
+    return _OC_QUERY_RE.sub(r"\1{LAW_OC}", text)
+
+
+def safe_error_message(error: Any, *, max_length: int = 2000) -> str:
+    """외부 예외 문구를 인증값 없이 제한된 길이로 반환한다."""
+    message = redact_sensitive(error).replace("\x00", "\\0")
+    if len(message) > max_length:
+        return message[:max_length] + "…(생략)"
+    return message
+
+
+class RedactingFormatter(logging.Formatter):
+    """파일·콘솔·traceback을 포함한 최종 로그 문자열을 마스킹한다."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_sensitive(super().format(record))
+
+
+class CompactConsoleFormatter(RedactingFormatter):
     """파일 로그의 예외 상세를 유지하면서 터미널에는 한 줄만 표시한다."""
 
     def format(self, record: logging.LogRecord) -> str:
@@ -183,15 +229,22 @@ PROGRESS_BAR_FORMAT = (
 )
 
 
-def setup_logging(verbose: bool = False) -> Tuple[logging.Logger, Path]:
+def setup_logging(
+    verbose: bool = False,
+    run_id: Optional[str] = None,
+) -> Tuple[logging.Logger, Path]:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = LOG_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    safe_run_id = re.sub(r"[^A-Za-z0-9_-]", "", run_id or uuid.uuid4().hex[:12])
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    log_path = LOG_DIR / f"run_{stamp}_{safe_run_id}.log"
 
     logger = logging.getLogger("collect_law")
     logger.setLevel(logging.INFO)
+    for handler in logger.handlers:
+        handler.close()
     logger.handlers.clear()
 
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    fmt = RedactingFormatter("%(asctime)s | %(levelname)s | %(message)s")
 
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setLevel(logging.INFO)
@@ -219,6 +272,7 @@ def load_config() -> str:
             "LAW_OC 환경변수가 설정되지 않았습니다. "
             "프로젝트 폴더에 .env 파일을 만들고 LAW_OC=발급받은값 형식으로 입력하세요."
         )
+    _register_sensitive_value(oc)
     return oc
 
 
@@ -296,7 +350,7 @@ def build_api_url(row: pd.Series, oc: str) -> Tuple[str, str, str]:
 
 def mask_oc_in_url(url: str) -> str:
     """URL에 포함된 OC 값을 {LAW_OC}로 마스킹한다."""
-    return re.sub(r"(OC=)[^&]*", r"\1{LAW_OC}", url)
+    return redact_sensitive(url)
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +405,7 @@ def fetch_xml(url: str, logger: logging.Logger) -> FetchResult:
                                error_type="HTTP_ERROR",
                                error_message=f"HTTP {resp.status_code}")
         except requests.exceptions.Timeout as e:
-            last_err = f"Timeout: {e}"
+            last_err = safe_error_message(f"Timeout: {e}")
             if attempt < len(RETRY_DELAYS):
                 delay = RETRY_DELAYS[attempt]
                 logger.warning(f"Timeout -> {delay}s 후 재시도 ({attempt + 1}/{len(RETRY_DELAYS)})")
@@ -360,10 +414,13 @@ def fetch_xml(url: str, logger: logging.Logger) -> FetchResult:
             return FetchResult(False, http_status=last_status,
                                error_type="TIMEOUT", error_message=last_err)
         except requests.exceptions.RequestException as e:
-            last_err = f"RequestException: {e}"
+            last_err = safe_error_message(f"RequestException: {e}")
             if attempt < len(RETRY_DELAYS):
                 delay = RETRY_DELAYS[attempt]
-                logger.warning(f"RequestException -> {delay}s 후 재시도: {e}")
+                logger.warning(
+                    f"RequestException -> {delay}s 후 재시도: "
+                    f"{safe_error_message(e)}"
+                )
                 time.sleep(delay)
                 continue
             return FetchResult(False, http_status=last_status,
@@ -392,12 +449,41 @@ def _md_dir_for(api_target: str) -> Path:
     raise ValueError(f"알 수 없는 api_target: {api_target!r}")
 
 
+def _atomic_write_text(
+    path: Path,
+    text: str,
+    *,
+    encoding: str,
+    newline: Optional[str] = None,
+) -> None:
+    """같은 디렉터리의 임시 파일을 완성한 뒤 원자적으로 승격한다."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        with temp_path.open(
+            "x",
+            encoding=encoding,
+            newline=newline,
+        ) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
 def save_raw_xml(api_target: str, base_name: str, xml_text: str) -> Path:
-    """원시 XML 응답을 저장하고 경로를 반환한다."""
+    """검증이 끝난 XML을 원자적으로 저장하고 경로를 반환한다."""
+    if not xml_text or not xml_text.strip():
+        raise ValueError("빈 XML은 캐시로 저장할 수 없습니다.")
     target_dir = _xml_dir_for(api_target)
-    target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / f"{base_name}.xml"
-    path.write_text(xml_text, encoding="utf-8")
+    _atomic_write_text(path, xml_text, encoding="utf-8", newline="")
     return path
 
 
@@ -440,11 +526,95 @@ def base_name_for_title(title: str) -> str:
     return safe_filename(title)
 
 
+_ALLOWED_DOCUMENT_TYPES = {"법령", "행정규칙", "3단비교"}
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _expected_base_name(document_type: str, title: str) -> Tuple[str, str]:
+    target_by_type = {
+        "법령": "law",
+        "행정규칙": "admrul",
+        "3단비교": "thdCmp",
+    }
+    target = target_by_type[document_type]
+    base_name = base_name_for_title(title)
+    if target == "thdCmp":
+        base_name = f"{base_name}{THDCMP_FILE_SUFFIX}"
+    return target, base_name
+
+
+def _is_windows_reserved_filename(base_name: str) -> bool:
+    first_component = base_name.rstrip(" .").split(".", 1)[0].rstrip(" ").upper()
+    return first_component in _WINDOWS_RESERVED_NAMES
+
+
+def validate_source_rows(df: pd.DataFrame) -> None:
+    """수집 시작 전에 CSV 전체의 값과 예상 출력 경로를 검증한다."""
+    required = ["문서유형", "명칭"]
+    missing_columns = [column for column in required if column not in df.columns]
+    if missing_columns:
+        raise ValueError(f"필수 컬럼이 없습니다: {', '.join(missing_columns)}")
+    if df.empty:
+        raise ValueError("수집 대상 CSV가 비어 있습니다.")
+
+    errors: List[str] = []
+    seen_paths: Dict[Tuple[str, str], Tuple[str, str, int]] = {}
+    for position, (_, row) in enumerate(df.iterrows(), start=2):
+        document_type = str(row.get("문서유형", "") or "").strip()
+        title = str(row.get("명칭", "") or "").strip()
+
+        if not document_type:
+            errors.append(f"{position}행: 문서유형이 비어 있음")
+        elif document_type not in _ALLOWED_DOCUMENT_TYPES:
+            errors.append(
+                f"{position}행: 허용되지 않은 문서유형 {document_type!r}"
+            )
+        if not title:
+            errors.append(f"{position}행: 명칭이 비어 있음")
+        if document_type not in _ALLOWED_DOCUMENT_TYPES or not title:
+            continue
+
+        title_base_name = base_name_for_title(title)
+        target, base_name = _expected_base_name(document_type, title)
+        if title_base_name == "untitled" and title.casefold() != "untitled":
+            errors.append(f"{position}행: 명칭을 안전한 파일명으로 변환할 수 없음")
+            continue
+        if _is_windows_reserved_filename(title_base_name):
+            errors.append(
+                f"{position}행: Windows 예약 파일명을 사용할 수 없음 "
+                f"({title_base_name!r})"
+            )
+            continue
+
+        normalized_name = unicodedata.normalize("NFC", base_name).casefold()
+        path_key = (target, normalized_name)
+        current = (document_type, title, position)
+        previous = seen_paths.get(path_key)
+        if previous is None:
+            seen_paths[path_key] = current
+        elif previous[:2] != current[:2]:
+            errors.append(
+                f"{position}행: 예상 파일명 {base_name!r}이 "
+                f"{previous[2]}행 {previous[1]!r}과 충돌"
+            )
+
+    if errors:
+        preview = "\n - ".join(errors[:20])
+        remainder = len(errors) - min(len(errors), 20)
+        if remainder:
+            preview += f"\n - 외 {remainder}건"
+        raise ValueError(f"CSV 사전 검증 실패:\n - {preview}")
+
+
 def find_cached_xml(api_target: str, base_name: str) -> Optional[Path]:
     """캐시된 raw_xml 파일이 있으면 경로를 반환."""
     target_dir = _xml_dir_for(api_target)
     p = target_dir / f"{base_name}.xml"
-    if p.exists() and p.stat().st_size > 0:
+    if p.exists():
         return p
     return None
 
@@ -523,6 +693,12 @@ _APPENDIX_CONTENT_XML_RE = re.compile(
     re.DOTALL,
 )
 _CDATA_XML_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.DOTALL)
+_UNSAFE_XML_DECL_RE = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
+_EXPECTED_XML_ROOTS = {
+    "law": {"법령"},
+    "admrul": {"AdmRulService"},
+    "thdCmp": {"ThdCmpLawXService"},
+}
 
 
 def _normalize_appendix_cdata_boundaries(xml_text: str) -> str:
@@ -564,38 +740,128 @@ def _normalize_appendix_cdata_boundaries(xml_text: str) -> str:
 
 
 def parse_xml_root(xml_text: str):
-    """lxml이 있으면 lxml, 없으면 표준 ET로 root element를 반환."""
+    """외부 엔티티와 복구 파싱을 금지하고 XML root를 반환한다."""
+    if not isinstance(xml_text, str) or not xml_text.strip():
+        raise ValueError("XML 본문이 비어 있습니다.")
+    if _UNSAFE_XML_DECL_RE.search(xml_text):
+        raise ValueError("DOCTYPE/ENTITY 선언이 포함된 XML은 허용하지 않습니다.")
     if _HAS_LXML:
-        parser = LET.XMLParser(recover=True, encoding="utf-8")  # type: ignore[attr-defined]
+        parser = LET.XMLParser(  # type: ignore[attr-defined]
+            recover=False,
+            resolve_entities=False,
+            load_dtd=False,
+            no_network=True,
+            huge_tree=False,
+        )
         data = xml_text.encode("utf-8")
         root = LET.fromstring(data, parser=parser)  # type: ignore[attr-defined]
         if root is None:
             raise ValueError("XML 파싱 실패(lxml): root 없음")
         return root
-    return ET.fromstring(xml_text)
+    parser = ET.XMLParser()
+    return ET.fromstring(xml_text, parser=parser)
+
+
+def _validate_root_for_target(root, api_target: str) -> None:
+    expected = _EXPECTED_XML_ROOTS.get(api_target)
+    if expected is None:
+        raise ValueError(f"알 수 없는 api_target: {api_target!r}")
+    actual = _localname(root.tag)
+    if actual not in expected:
+        expected_label = ", ".join(sorted(expected))
+        raise ValueError(
+            f"XML root 불일치: target={api_target}, "
+            f"예상={expected_label}, 실제={actual or '(empty)'}"
+        )
+
+
+_ARTICLE_BODY_KEYS_BY_TARGET = {
+    "law": frozenset({"조문내용", "항내용", "호내용", "목내용"}),
+    "admrul": frozenset({"조문내용", "항내용", "호내용", "목내용"}),
+    "thdCmp": frozenset({"조내용"}),
+}
+
+
+def _contains_article_body(value: Any, body_keys: frozenset[str]) -> bool:
+    """조문 번호ㆍ제목을 제외한 실제 본문 필드가 있는지 확인한다."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in body_keys and bool(str(item or "").strip()):
+                return True
+            if isinstance(item, (dict, list, tuple)) and _contains_article_body(
+                item, body_keys
+            ):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_contains_article_body(item, body_keys) for item in value)
+    return False
+
+
+def _validate_parsed_document(parsed: Dict[str, Any], api_target: str) -> None:
+    if api_target == "law":
+        identifier = parsed.get("법령ID", "")
+        title = parsed.get("법령명_한글", "")
+    elif api_target == "admrul":
+        identifier = (
+            parsed.get("행정규칙ID", "")
+            or parsed.get("행정규칙일련번호", "")
+        )
+        title = parsed.get("행정규칙명", "")
+    elif api_target == "thdCmp":
+        identifier = parsed.get("법령ID", "")
+        title = parsed.get("법령명", "")
+    else:
+        raise ValueError(f"알 수 없는 api_target: {api_target!r}")
+
+    if not str(identifier or "").strip():
+        raise ValueError(f"{api_target} XML에 필수 ID가 없습니다.")
+    if not str(title or "").strip():
+        raise ValueError(f"{api_target} XML에 필수 명칭이 없습니다.")
+
+    articles = parsed.get("articles") or []
+    body_keys = _ARTICLE_BODY_KEYS_BY_TARGET[api_target]
+    if not articles or not _contains_article_body(articles, body_keys):
+        raise ValueError(f"{api_target} XML에 유효한 본문 조문이 없습니다.")
 
 
 def detect_xml_error(root) -> str:
     """법제처 API 오류 응답 감지. 오류 메시지가 있으면 문자열, 없으면 ''"""
-    # 오류 메시지 후보 태그
-    candidates = ["Error", "error", "ErrorMessage", "errorMessage", "ERROR", "RESULT", "Result"]
+    success_messages = {"정상", "success", "ok"}
+    success_codes = {"", "0", "00", "000", "success", "ok"}
+
+    # 잘 알려진 구조화 형식: <RESULT><CODE>...</CODE><MSG>...</MSG></RESULT>
+    msg_e = _find_first(root, "MSG")
+    if msg_e is not None:
+        msg = _text(msg_e).strip()
+        code_e = _find_first(root, "CODE")
+        code = _text(code_e).strip() if code_e is not None else ""
+        normalized_msg = re.sub(r"\s+", " ", msg).casefold()
+        normalized_code = code.casefold()
+        if normalized_msg in success_messages and normalized_code in success_codes:
+            return ""
+        if msg or (code and normalized_code not in success_codes):
+            return safe_error_message(f"{code} {msg}".strip())
+
+    # 오류 메시지 후보 태그. 부분 문자열이 아닌 정확한 성공값만 제외한다.
+    candidates = ["Error", "error", "ErrorMessage", "errorMessage", "ERROR"]
     for tag in candidates:
         e = _find_first(root, tag)
         if e is not None:
-            msg = _text(e)
+            msg = _text(e).strip()
             if msg:
-                # "정상" 류 메시지는 오류로 판정하지 않음
-                if re.search(r"(정상|success|ok)", msg, re.IGNORECASE):
+                if re.sub(r"\s+", " ", msg).casefold() in success_messages:
                     continue
-                return msg
-    # 잘 알려진 오류 형식: <RESULT><CODE>...</CODE><MSG>...</MSG></RESULT>
-    msg_e = _find_first(root, "MSG")
-    if msg_e is not None:
-        msg = _text(msg_e)
-        code_e = _find_first(root, "CODE")
-        code = _text(code_e) if code_e is not None else ""
-        if msg and not re.search(r"(정상|success|ok)", msg, re.IGNORECASE):
-            return f"{code} {msg}".strip()
+                return safe_error_message(msg)
+
+    # RESULT에 자식 없이 문구만 담긴 구형 응답.
+    for tag in ("RESULT", "Result", "result"):
+        result = _find_first(root, tag)
+        if result is None or list(result):
+            continue
+        message = _text(result).strip()
+        if message and re.sub(r"\s+", " ", message).casefold() not in success_messages:
+            return safe_error_message(message)
     return ""
 
 
@@ -711,6 +977,7 @@ def parse_law_xml(xml_text: str) -> Dict[str, Any]:
     err = detect_xml_error(root)
     if err:
         raise ValueError(f"API 오류 응답: {err}")
+    _validate_root_for_target(root, "law")
 
     basic = _find_first(root, "기본정보")
     if basic is None:
@@ -772,6 +1039,7 @@ def parse_law_xml(xml_text: str) -> Dict[str, Any]:
         if t:
             parsed["reasons"].append(t)
 
+    _validate_parsed_document(parsed, "law")
     return parsed
 
 
@@ -783,6 +1051,7 @@ def parse_admrul_xml(xml_text: str) -> Dict[str, Any]:
     err = detect_xml_error(root)
     if err:
         raise ValueError(f"API 오류 응답: {err}")
+    _validate_root_for_target(root, "admrul")
 
     basic = _find_first(root, "행정규칙기본정보")
     if basic is None:
@@ -874,6 +1143,7 @@ def parse_admrul_xml(xml_text: str) -> Dict[str, Any]:
         if t:
             parsed["reasons"].append(t)
 
+    _validate_parsed_document(parsed, "admrul")
     return parsed
 
 
@@ -923,6 +1193,7 @@ def parse_thdcmp_xml(xml_text: str) -> Dict[str, Any]:
     err = detect_xml_error(root)
     if err:
         raise ValueError(f"API 오류 응답: {err}")
+    _validate_root_for_target(root, "thdCmp")
 
     basic = _find_first(root, "기본정보")
     if basic is None:
@@ -950,7 +1221,19 @@ def parse_thdcmp_xml(xml_text: str) -> Dict[str, Any]:
     for jo in _find_direct_all(body, "법률조문"):
         parsed["articles"].append(_parse_thdcmp_article(jo))
 
+    _validate_parsed_document(parsed, "thdCmp")
     return parsed
+
+
+def parse_and_validate_xml(api_target: str, xml_text: str) -> Dict[str, Any]:
+    """target에 맞는 엄격 파서로 XML을 파싱하고 의미 구조를 검증한다."""
+    if api_target == "law":
+        return parse_law_xml(xml_text)
+    if api_target == "admrul":
+        return parse_admrul_xml(xml_text)
+    if api_target == "thdCmp":
+        return parse_thdcmp_xml(xml_text)
+    raise ValueError(f"알 수 없는 api_target: {api_target!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -2038,36 +2321,104 @@ def render_thdcmp_markdown(parsed: Dict[str, Any], collected_at: str,
 # 파일 저장 (Markdown / Manifest / Failed)
 # ---------------------------------------------------------------------------
 def write_markdown(api_target: str, base_name: str, md_text: str) -> Path:
+    if not md_text or not md_text.strip():
+        raise ValueError("빈 Markdown은 저장할 수 없습니다.")
     target_dir = _md_dir_for(api_target)
-    target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / f"{base_name}.md"
-    path.write_text(md_text, encoding="utf-8")
+    _atomic_write_text(path, md_text, encoding="utf-8", newline="")
     return path
 
 
+def _atomic_write_csv(
+    path: Path,
+    fieldnames: List[str],
+    rows: List[Dict[str, Any]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        with temp_path.open("x", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                safe_row = {
+                    key: redact_sensitive(row.get(key, ""))
+                    for key in fieldnames
+                }
+                writer.writerow(safe_row)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
 def write_manifest(rows: List[Dict[str, Any]]) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with MANIFEST_CSV.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS)
-        writer.writeheader()
-        for row in rows:
-            safe_row = {k: row.get(k, "") for k in MANIFEST_COLUMNS}
-            writer.writerow(safe_row)
+    _atomic_write_csv(MANIFEST_CSV, MANIFEST_COLUMNS, rows)
 
 
 def write_failed_items(rows: List[Dict[str, Any]]) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with FAILED_CSV.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=FAILED_COLUMNS)
-        writer.writeheader()
-        for row in rows:
-            safe_row = {k: row.get(k, "") for k in FAILED_COLUMNS}
-            writer.writerow(safe_row)
+    _atomic_write_csv(FAILED_CSV, FAILED_COLUMNS, rows)
 
 
 # ---------------------------------------------------------------------------
 # 메인
 # ---------------------------------------------------------------------------
+class AlreadyRunningError(RuntimeError):
+    pass
+
+
+class SingleRunLock:
+    """프로세스 종료 시 OS가 자동 해제하는 단일 실행 파일 잠금."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._handle = None
+
+    def __enter__(self) -> "SingleRunLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, ImportError) as error:
+            handle.close()
+            raise AlreadyRunningError(
+                "다른 수집 실행이 진행 중이거나 잠금을 확보할 수 없습니다."
+            ) from error
+        self._handle = handle
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def _ensure_dirs() -> None:
     for d in (
         MD_LAW_DIR, MD_ADMRUL_DIR, MD_THDCMP_DIR,
@@ -2136,10 +2487,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
-    logger, log_path = setup_logging(verbose=args.verbose)
+def _main_locked(args: argparse.Namespace, run_id: str) -> int:
+    logger, log_path = setup_logging(verbose=args.verbose, run_id=run_id)
     _ensure_dirs()
+    logger.info(f"run_id: {run_id}")
+
+    source_csv = args.input
+    if not source_csv.is_absolute():
+        source_csv = PROJECT_DIR / source_csv
+    source_csv = source_csv.resolve()
+    logger.info(f"입력 목록: {source_csv}")
+
+    try:
+        df = read_source_csv(source_csv)
+        total_input = len(df)
+        validate_source_rows(df)
+        df = deduplicate_rows(df, logger)
+        total_targets = len(df)
+    except Exception as error:
+        logger.error(f"입력 CSV 검증 실패: {safe_error_message(error)}")
+        return 1
 
     if args.from_cache:
         mode_label = "CACHE_ONLY (네트워크 호출 없음)"
@@ -2148,23 +2515,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         try:
             oc = load_config()
-        except Exception as e:
-            logger.error(str(e))
+        except Exception as error:
+            logger.error(safe_error_message(error))
             return 1
         mode_label = "MISSING_ONLY (캐시 우선, 빠진 것만 API)" if args.missing_only else "FETCH_ALL (전부 API)"
         logger.info(f"실행 모드: {mode_label}")
         logger.info("LAW_OC 로드 완료 (값은 마스킹)")
-
-    source_csv = args.input
-    if not source_csv.is_absolute():
-        source_csv = PROJECT_DIR / source_csv
-    source_csv = source_csv.resolve()
-    logger.info(f"입력 목록: {source_csv}")
-
-    df = read_source_csv(source_csv)
-    total_input = len(df)
-    df = deduplicate_rows(df, logger)
-    total_targets = len(df)
 
     manifest_rows: List[Dict[str, Any]] = []
     failed_rows: List[Dict[str, Any]] = []
@@ -2244,10 +2600,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             api_target, url, masked_url = build_api_url(row, oc)
             manifest["api_target"] = api_target
             manifest["api_url_without_oc"] = masked_url
-        except Exception as e:
+        except Exception as error:
+            error_message = safe_error_message(error)
             fail += 1
             manifest["status"] = "FAIL"
-            manifest["error_message"] = f"URL 구성 실패: {e}"
+            manifest["error_message"] = f"URL 구성 실패: {error_message}"
             manifest_rows.append(manifest)
             failed_rows.append({
                 "source_index": source_index,
@@ -2256,45 +2613,92 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "api_target": "",
                 "api_url_without_oc": "",
                 "error_type": "BUILD_URL_FAIL",
-                "error_message": str(e),
+                "error_message": error_message,
                 "http_status": "",
                 "collected_at": collected_at,
             })
-            logger.error(f"[FAIL] {source_index} {title}: URL 구성 실패 - {e}")
+            logger.error(
+                f"[FAIL] {source_index} {title}: URL 구성 실패 - {error_message}"
+            )
             continue
 
         # 파일 base_name (명칭만으로 결정).
         # 3단비교는 동일 명칭의 일반 법령과 구분하기 위해 접미사를 붙인다.
-        base_name = base_name_for_title(title)
-        if api_target == "thdCmp":
-            base_name = f"{base_name}{THDCMP_FILE_SUFFIX}"
-        cached_path = find_cached_xml(api_target, base_name)
+        _, base_name = _expected_base_name(dtype, title)
+        try:
+            cached_path = find_cached_xml(api_target, base_name)
+        except Exception as error:
+            error_message = safe_error_message(error)
+            fail += 1
+            manifest["status"] = "FAIL"
+            manifest["error_message"] = f"캐시 확인 실패: {error_message}"
+            manifest_rows.append(manifest)
+            failed_rows.append({
+                "source_index": source_index,
+                "document_type": dtype,
+                "title": title,
+                "api_target": api_target,
+                "api_url_without_oc": masked_url,
+                "error_type": "CACHE_LOOKUP_FAIL",
+                "error_message": error_message,
+                "http_status": "",
+                "collected_at": collected_at,
+            })
+            logger.error(
+                f"[FAIL] {source_index} {title}: 캐시 확인 실패 - "
+                f"{error_message}"
+            )
+            continue
 
         # 소스 결정: 캐시 vs HTTP fetch
         xml_text = ""
         xml_path: Optional[Path] = None
+        parsed: Optional[Dict[str, Any]] = None
+        md_text: Optional[str] = None
+        counts: Optional[Dict[str, int]] = None
         http_status_for_failed: Any = ""
 
-        if args.from_cache:
-            # 캐시 전용 모드 - 캐시가 없으면 스킵
-            if cached_path is None:
-                skipped += 1
-                manifest["status"] = "SKIP_NO_CACHE"
-                manifest["error_message"] = "캐시된 XML 없음 (--from-cache 모드)"
-                manifest_rows.append(manifest)
-                logger.info(f"[SKIP] {source_index} {title}: 캐시 없음")
-                continue
-            xml_text = cached_path.read_text(encoding="utf-8")
-            xml_path = cached_path
-            cache_used += 1
-            logger.info(f"캐시: {source_index} [{api_target}] {title} <- {cached_path.name}")
+        if args.from_cache and cached_path is None:
+            skipped += 1
+            manifest["status"] = "SKIP_NO_CACHE"
+            manifest["error_message"] = "캐시된 XML 없음 (--from-cache 모드)"
+            manifest_rows.append(manifest)
+            logger.warning(f"[SKIP] {source_index} {title}: 캐시 없음")
+            continue
 
-        elif args.missing_only and cached_path is not None:
-            # 캐시가 있는 항목은 그대로 사용
-            xml_text = cached_path.read_text(encoding="utf-8")
-            xml_path = cached_path
+        use_cache = cached_path is not None and (
+            args.from_cache or args.missing_only
+        )
+        if use_cache:
+            try:
+                xml_text = cached_path.read_text(encoding="utf-8")
+                xml_path = cached_path
+            except Exception as error:
+                error_message = safe_error_message(error)
+                fail += 1
+                manifest["status"] = "FAIL"
+                manifest["error_message"] = f"캐시 XML 읽기 실패: {error_message}"
+                manifest_rows.append(manifest)
+                failed_rows.append({
+                    "source_index": source_index,
+                    "document_type": dtype,
+                    "title": title,
+                    "api_target": api_target,
+                    "api_url_without_oc": masked_url,
+                    "error_type": "CACHE_READ_FAIL",
+                    "error_message": error_message,
+                    "http_status": "",
+                    "collected_at": collected_at,
+                })
+                logger.error(
+                    f"[FAIL] {source_index} {title}: 캐시 XML 읽기 실패 - "
+                    f"{error_message}"
+                )
+                continue
             cache_used += 1
-            logger.info(f"캐시: {source_index} [{api_target}] {title} <- {cached_path.name}")
+            logger.info(
+                f"캐시: {source_index} [{api_target}] {title} <- {cached_path.name}"
+            )
 
         else:
             # API로 새로 받기 (기본 모드, 또는 missing-only인데 캐시가 없는 경우)
@@ -2304,9 +2708,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             http_status_for_failed = result.http_status or ""
 
             if not result.ok:
+                error_message = safe_error_message(result.error_message)
                 fail += 1
                 manifest["status"] = "FAIL"
-                manifest["error_message"] = result.error_message
+                manifest["error_message"] = error_message
                 manifest_rows.append(manifest)
                 failed_rows.append({
                     "source_index": source_index,
@@ -2315,20 +2720,101 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "api_target": api_target,
                     "api_url_without_oc": masked_url,
                     "error_type": result.error_type,
-                    "error_message": result.error_message,
+                    "error_message": error_message,
                     "http_status": http_status_for_failed,
                     "collected_at": collected_at,
                 })
-                logger.error(f"[FAIL] {source_index} {title}: HTTP {result.http_status} {result.error_message}")
+                logger.error(
+                    f"[FAIL] {source_index} {title}: HTTP {result.http_status} "
+                    f"{error_message}"
+                )
                 continue
 
             xml_text = result.xml_text
+            try:
+                # 새 응답은 파싱·의미 검증을 통과해야만 기존 캐시를 교체한다.
+                parsed = parse_and_validate_xml(api_target, xml_text)
+            except Exception as error:
+                error_message = safe_error_message(error)
+                fail += 1
+                manifest["status"] = "FAIL"
+                manifest["error_message"] = f"XML 파싱 실패: {error_message}"
+                manifest_rows.append(manifest)
+                failed_rows.append({
+                    "source_index": source_index,
+                    "document_type": dtype,
+                    "title": title,
+                    "api_target": api_target,
+                    "api_url_without_oc": masked_url,
+                    "error_type": "PARSE_FAIL",
+                    "error_message": error_message,
+                    "http_status": http_status_for_failed,
+                    "collected_at": collected_at,
+                })
+                logger.error(
+                    f"[FAIL] {source_index} {title}: 파싱 실패 - {error_message}"
+                )
+                continue
+
+            try:
+                # 렌더링까지 메모리에서 성공한 응답만 캐시로 승격한다.
+                if api_target == "thdCmp":
+                    md_text, counts = render_thdcmp_markdown(
+                        parsed, collected_at, title
+                    )
+                else:
+                    md_text, counts = render_markdown(
+                        parsed, api_target, collected_at, title
+                    )
+                if not md_text or not md_text.strip():
+                    raise ValueError("Markdown 렌더링 결과가 비어 있습니다.")
+            except Exception as error:
+                error_message = safe_error_message(error)
+                fail += 1
+                manifest["status"] = "FAIL"
+                manifest["error_message"] = f"Markdown 렌더링 실패: {error_message}"
+                manifest_rows.append(manifest)
+                failed_rows.append({
+                    "source_index": source_index,
+                    "document_type": dtype,
+                    "title": title,
+                    "api_target": api_target,
+                    "api_url_without_oc": masked_url,
+                    "error_type": "RENDER_FAIL",
+                    "error_message": error_message,
+                    "http_status": http_status_for_failed,
+                    "collected_at": collected_at,
+                })
+                logger.error(
+                    f"[FAIL] {source_index} {title}: 렌더링 실패 - "
+                    f"{error_message}"
+                )
+                continue
 
             try:
                 xml_path = save_raw_xml(api_target, base_name, xml_text)
-            except Exception as e:
-                logger.warning(f"[WARN] 원시 XML 저장 실패: {e}")
-                xml_path = None
+            except Exception as error:
+                error_message = safe_error_message(error)
+                fail += 1
+                manifest["status"] = "FAIL"
+                manifest["error_message"] = f"원시 XML 저장 실패: {error_message}"
+                manifest_rows.append(manifest)
+                failed_rows.append({
+                    "source_index": source_index,
+                    "document_type": dtype,
+                    "title": title,
+                    "api_target": api_target,
+                    "api_url_without_oc": masked_url,
+                    "error_type": "RAW_XML_WRITE_FAIL",
+                    "error_message": error_message,
+                    "http_status": http_status_for_failed,
+                    "collected_at": collected_at,
+                })
+                logger.error(
+                    f"[FAIL] {source_index} {title}: 원시 XML 저장 실패 - "
+                    f"{error_message}"
+                )
+                continue
             fetched += 1
 
         if xml_path is not None:
@@ -2337,44 +2823,58 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Markdown 파일명 - 저장된 XML과 같은 base_name 사용
         md_base_name = xml_path.stem if xml_path is not None else base_name
 
-        # XML 파싱
-        try:
-            if api_target == "law":
-                parsed = parse_law_xml(xml_text)
-            elif api_target == "thdCmp":
-                parsed = parse_thdcmp_xml(xml_text)
-            else:
-                parsed = parse_admrul_xml(xml_text)
-        except Exception as e:
-            fail += 1
-            manifest["status"] = "FAIL"
-            manifest["error_message"] = f"XML 파싱 실패: {e}"
-            manifest_rows.append(manifest)
-            failed_rows.append({
-                "source_index": source_index,
-                "document_type": dtype,
-                "title": title,
-                "api_target": api_target,
-                "api_url_without_oc": masked_url,
-                "error_type": "PARSE_FAIL",
-                "error_message": str(e),
-                "http_status": http_status_for_failed,
-                "collected_at": collected_at,
-            })
-            logger.error(f"[FAIL] {source_index} {title}: 파싱 실패 - {e}")
-            continue
+        # 캐시 XML도 동일한 엄격 검증을 통과해야 Markdown으로 승격한다.
+        if parsed is None:
+            try:
+                parsed = parse_and_validate_xml(api_target, xml_text)
+            except Exception as error:
+                error_message = safe_error_message(error)
+                fail += 1
+                manifest["status"] = "FAIL"
+                manifest["error_message"] = f"XML 파싱 실패: {error_message}"
+                manifest_rows.append(manifest)
+                failed_rows.append({
+                    "source_index": source_index,
+                    "document_type": dtype,
+                    "title": title,
+                    "api_target": api_target,
+                    "api_url_without_oc": masked_url,
+                    "error_type": "PARSE_FAIL",
+                    "error_message": error_message,
+                    "http_status": http_status_for_failed,
+                    "collected_at": collected_at,
+                })
+                logger.error(
+                    f"[FAIL] {source_index} {title}: 파싱 실패 - "
+                    f"{error_message}"
+                )
+                continue
 
         # Markdown 렌더링
         try:
-            if api_target == "thdCmp":
-                md_text, counts = render_thdcmp_markdown(parsed, collected_at, title)
-            else:
-                md_text, counts = render_markdown(parsed, api_target, collected_at, title)
+            if md_text is None or counts is None:
+                if api_target == "thdCmp":
+                    md_text, counts = render_thdcmp_markdown(
+                        parsed, collected_at, title
+                    )
+                else:
+                    md_text, counts = render_markdown(
+                        parsed, api_target, collected_at, title
+                    )
+            if not md_text or not md_text.strip():
+                raise ValueError("Markdown 렌더링 결과가 비어 있습니다.")
             md_path = write_markdown(api_target, md_base_name, md_text)
-        except Exception as e:
+            if md_path.stat().st_size == 0:
+                raise ValueError("Markdown 파일이 0바이트")
+        except Exception as error:
+            error_message = safe_error_message(error)
+            error_type = (
+                "EMPTY_MD" if error_message == "Markdown 파일이 0바이트"
+                else "RENDER_FAIL"
+            )
             fail += 1
             manifest["status"] = "FAIL"
-            manifest["error_message"] = f"Markdown 작성 실패: {e}"
+            manifest["error_message"] = f"Markdown 작성 실패: {error_message}"
             manifest_rows.append(manifest)
             failed_rows.append({
                 "source_index": source_index,
@@ -2382,32 +2882,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "title": title,
                 "api_target": api_target,
                 "api_url_without_oc": masked_url,
-                "error_type": "RENDER_FAIL",
-                "error_message": str(e),
+                "error_type": error_type,
+                "error_message": error_message,
                 "http_status": http_status_for_failed,
                 "collected_at": collected_at,
             })
-            logger.error(f"[FAIL] {source_index} {title}: 렌더 실패 - {e}")
-            continue
-
-        # 0바이트 검증
-        if md_path.stat().st_size == 0:
-            fail += 1
-            manifest["status"] = "FAIL"
-            manifest["error_message"] = "Markdown 파일이 0바이트"
-            manifest_rows.append(manifest)
-            failed_rows.append({
-                "source_index": source_index,
-                "document_type": dtype,
-                "title": title,
-                "api_target": api_target,
-                "api_url_without_oc": masked_url,
-                "error_type": "EMPTY_MD",
-                "error_message": "Markdown 파일이 0바이트",
-                "http_status": http_status_for_failed,
-                "collected_at": collected_at,
-            })
-            logger.error(f"[FAIL] {source_index} {title}: Markdown 0바이트")
+            logger.error(
+                f"[FAIL] {source_index} {title}: 렌더 실패 - {error_message}"
+            )
             continue
 
         # 성공 처리
@@ -2489,8 +2971,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.info(f"[OK]   {source_index} {title} -> {manifest['markdown_path']}")
 
     # 결과 파일 작성
-    write_manifest(manifest_rows)
-    write_failed_items(failed_rows)
+    output_write_failed = False
+    try:
+        write_manifest(manifest_rows)
+    except Exception as error:
+        output_write_failed = True
+        logger.error(
+            f"manifest 저장 실패(기존 파일 보존): "
+            f"{safe_error_message(error)}"
+        )
+    try:
+        write_failed_items(failed_rows)
+    except Exception as error:
+        output_write_failed = True
+        logger.error(
+            f"failed_items 저장 실패(기존 파일 보존): "
+            f"{safe_error_message(error)}"
+        )
 
     # 요약
     summary = (
@@ -2526,7 +3023,40 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"  상세 로그 | {log_path.relative_to(PROJECT_DIR)}"
     )
     tqdm.write(console_summary, file=sys.stderr)
-    return 0 if fail == 0 else 2
+    return 0 if fail == 0 and skipped == 0 and not output_write_failed else 2
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    run_id = uuid.uuid4().hex[:12]
+    lock_path = OUTPUT_DIR / ".collect_law_markdown.lock"
+    owns_run_logger = False
+    try:
+        with SingleRunLock(lock_path):
+            owns_run_logger = True
+            return _main_locked(args, run_id)
+    except AlreadyRunningError as error:
+        tqdm.write(f"ERROR | {safe_error_message(error)}", file=sys.stderr)
+        return 3
+    except Exception as error:
+        error_message = safe_error_message(error)
+        logger = logging.getLogger("collect_law")
+        if logger.handlers:
+            logger.exception(f"실행 중 예기치 못한 오류: {error_message}")
+        tqdm.write(
+            f"ERROR | 실행 중 예기치 못한 오류: {error_message}",
+            file=sys.stderr,
+        )
+        return 1
+    finally:
+        # CLI 프로세스가 끝나기 전에도 main()을 라이브러리처럼 호출한 쪽이
+        # 임시 출력 디렉터리를 바로 정리할 수 있도록 파일 핸들을 해제한다.
+        # 잠금을 얻지 못한 호출은 진행 중인 다른 실행의 logger를 닫지 않는다.
+        if owns_run_logger:
+            logger = logging.getLogger("collect_law")
+            for handler in list(logger.handlers):
+                handler.close()
+                logger.removeHandler(handler)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ law_targets.csv
 # Generated output and Python cache
 output/
 __pycache__/
+.pytest_cache/
 *.py[cod]
 
 # IDE and agent-specific settings
