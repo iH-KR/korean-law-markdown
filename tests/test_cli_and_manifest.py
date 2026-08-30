@@ -104,9 +104,16 @@ def test_cache_only_cli_succeeds_in_isolated_output_and_manifest_is_consistent(
         collector.MD_THDCMP_DIR
         / f"테스트_법률{collector.THDCMP_FILE_SUFFIX}.md"
     ).read_text(encoding="utf-8")
-    assert law_markdown.startswith("# 테스트 법률\n")
-    assert admrul_markdown.startswith("# 테스트 행정규칙\n")
-    assert thdcmp_markdown.startswith("# 테스트 법률 인용조문 3단비교\n")
+    expected_frontmatter_start = '---\n\nYAML스키마버전: "2"\n'
+    assert law_markdown.startswith(expected_frontmatter_start)
+    assert admrul_markdown.startswith(expected_frontmatter_start)
+    assert thdcmp_markdown.startswith(expected_frontmatter_start)
+    for markdown in (law_markdown, admrul_markdown, thdcmp_markdown):
+        assert "\n\n---\n\n# " in markdown
+        assert "## 문서정보" not in markdown
+    assert "\n# 테스트 법률\n" in law_markdown
+    assert "\n# 테스트 행정규칙\n" in admrul_markdown
+    assert "\n# 테스트 법률 인용조문 3단비교\n" in thdcmp_markdown
 
 
 def test_empty_markdown_is_never_reported_as_ok(

@@ -20,6 +20,7 @@ NotebookLM 업로드용 Markdown(.md) 파일로 변환한다.
   - output/raw_xml/laws/*.xml
   - output/raw_xml/administrative_rules/*.xml
   - output/raw_xml/thdcmp/*.xml
+  - output/raw_xml/**/*.xml.meta.json  (신규 API 수집 provenance sidecar)
   - output/manifest.csv
   - output/failed_items.csv
   - output/logs/run_*.log
@@ -30,6 +31,9 @@ NotebookLM 업로드용 Markdown(.md) 파일로 변환한다.
   python collect_law_markdown.py --missing-only   # 캐시가 없는 항목만 API, 있는 건 캐시 사용
   python collect_law_markdown.py --input targets.csv  # 다른 수집 목록 사용
   python collect_law_markdown.py --verbose        # 항목별 상세 로그도 터미널에 표시
+
+Markdown은 항상 NFKC_SEARCH_V1 검색 정규화를 적용한다. API 원문은 raw XML에
+보존되므로 별도의 비정규화 Markdown이나 병행 출력 폴더를 만들지 않는다.
 
 API URL 규칙 (OC 값은 환경변수 LAW_OC에서 읽음):
   - 법령:
@@ -43,8 +47,11 @@ API URL 규칙 (OC 값은 환경변수 LAW_OC에서 읽음):
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
+import hashlib
 import html
+import json
 import logging
 import os
 import re
@@ -53,10 +60,18 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, quote_plus, urlencode
+from urllib.parse import (
+    parse_qs,
+    quote,
+    quote_plus,
+    urlencode,
+    urljoin,
+    urlsplit,
+    urlunsplit,
+)
 
 import pandas as pd
 import requests
@@ -78,6 +93,7 @@ import xml.etree.ElementTree as ET
 # ---------------------------------------------------------------------------
 BASE_URL = "https://www.law.go.kr/DRF/lawService.do"
 LAW_SITE_ROOT = "https://www.law.go.kr"
+EMBEDDED_IMAGE_DOWNLOAD_URL = LAW_SITE_ROOT + "/flDownload.do?flSeq={}"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_TARGETS_CSV = PROJECT_DIR / "law_targets.csv"
@@ -100,6 +116,11 @@ READ_TIMEOUT = 60
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 RETRY_DELAYS = [2, 5, 10]
 MAX_FILENAME_LEN = 150
+MANIFEST_SCHEMA_VERSION = "4"
+RENDERER_VERSION = "4.0"
+FRONTMATTER_SCHEMA_VERSION = "2"
+NORMALIZATION_PROFILE = "NFKC_SEARCH_V1"
+RAW_METADATA_SCHEMA_VERSION = 1
 
 MANIFEST_COLUMNS = [
     "source_index",
@@ -130,6 +151,30 @@ MANIFEST_COLUMNS = [
     "normalized_links_count",
     "error_message",
     "collected_at",
+    "manifest_schema_version",
+    "renderer_version",
+    "run_id",
+    "source_mode",
+    "source_retrieved_at",
+    "source_timestamp_basis",
+    "processed_at",
+    "raw_xml_sha256",
+    "raw_xml_size_bytes",
+    "markdown_sha256",
+    "markdown_size_bytes",
+    "embedded_image_reference_count",
+    "embedded_image_link_count",
+    "unique_normalized_link_count",
+    "duplicate_link_count",
+    "invalid_link_count",
+    "has_attachment_links",
+    "has_any_links",
+    "has_embedded_image_references",
+    "thdcmp_referenced_article_count",
+    "thdcmp_rendered_article_count",
+    "thdcmp_duplicate_reference_count",
+    "normalization_profile",
+    "normalization_changed_field_count",
 ]
 
 FAILED_COLUMNS = [
@@ -143,6 +188,54 @@ FAILED_COLUMNS = [
     "http_status",
     "collected_at",
 ]
+
+
+@dataclass(frozen=True)
+class SourceProvenance:
+    """한 Markdown 결과가 어떤 XML 바이트에서 언제 만들어졌는지 나타낸다."""
+
+    source_mode: str
+    source_retrieved_at: str
+    source_timestamp_basis: str
+    processed_at: str
+    raw_xml_sha256: str
+    raw_xml_size_bytes: int
+
+
+def _utc_now_iso() -> str:
+    """초 단위 UTC ISO-8601 시각을 반환한다."""
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _iso8601_with_offset(value: str) -> str:
+    """시각 문자열을 초 단위 ISO-8601 오프셋 표기로 맞춘다.
+
+    새 실행은 UTC ``Z``를 직접 기록한다. 과거 호출자나 테스트가 오프셋 없는
+    로컬 시각을 넘긴 경우에는 실행 환경의 로컬 오프셋을 명시해 모호성을 없앤다.
+    파싱할 수 없는 값은 메타데이터에 잘못된 시각을 싣지 않도록 빈 값으로 둔다.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    candidate = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        local_timezone = datetime.now().astimezone().tzinfo
+        parsed = parsed.replace(tzinfo=local_timezone)
+    normalized = parsed.replace(microsecond=0).isoformat(timespec="seconds")
+    return normalized.replace("+00:00", "Z")
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +578,120 @@ def save_raw_xml(api_target: str, base_name: str, xml_text: str) -> Path:
     path = target_dir / f"{base_name}.xml"
     _atomic_write_text(path, xml_text, encoding="utf-8", newline="")
     return path
+
+
+def _raw_metadata_path(raw_path: Path) -> Path:
+    """원시 XML과 나란히 저장하는 provenance sidecar 경로를 반환한다."""
+    return raw_path.with_suffix(raw_path.suffix + ".meta.json")
+
+
+def write_raw_metadata(
+    raw_path: Path,
+    provenance: SourceProvenance,
+    *,
+    api_target: str,
+    requested_title: str,
+    api_url_without_oc: str,
+) -> Path:
+    """새 API 응답의 검증 가능한 수신 메타데이터를 원자적으로 저장한다."""
+    if provenance.source_mode != "API_FETCH":
+        raise ValueError("API 신규 수집 결과에만 provenance sidecar를 작성할 수 있습니다.")
+
+    metadata = {
+        "schema_version": RAW_METADATA_SCHEMA_VERSION,
+        "source_retrieved_at": provenance.source_retrieved_at,
+        "source_timestamp_basis": provenance.source_timestamp_basis,
+        "raw_xml_sha256": provenance.raw_xml_sha256,
+        "raw_xml_size_bytes": provenance.raw_xml_size_bytes,
+        "api_target": api_target,
+        "requested_title": requested_title,
+        # 인증값이 제거된 URL만 기록한다. 원래 요청 URL은 절대 sidecar에 넣지 않는다.
+        "api_url_without_oc": redact_sensitive(api_url_without_oc),
+    }
+    path = _raw_metadata_path(raw_path)
+    serialized = json.dumps(
+        metadata,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
+    _atomic_write_text(path, serialized, encoding="utf-8", newline="")
+    return path
+
+
+def _parse_utc_iso8601(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def provenance_from_cache(
+    raw_path: Path,
+    raw_bytes: bytes,
+    processed_at: str,
+    *,
+    expected_api_target: str,
+    expected_requested_title: str,
+) -> SourceProvenance:
+    """sidecar가 검증될 때만 캐시 XML의 원 수신시각을 신뢰한다."""
+    raw_hash = _sha256_bytes(raw_bytes)
+    raw_size = len(raw_bytes)
+    sidecar_path = _raw_metadata_path(raw_path)
+    if not sidecar_path.is_file():
+        return SourceProvenance(
+            "CACHE", "", "UNKNOWN_LEGACY_CACHE", processed_at, raw_hash, raw_size
+        )
+
+    try:
+        metadata = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return SourceProvenance(
+            "CACHE", "", "INVALID_CACHE_METADATA", processed_at, raw_hash, raw_size
+        )
+
+    if not isinstance(metadata, dict):
+        return SourceProvenance(
+            "CACHE", "", "INVALID_CACHE_METADATA", processed_at, raw_hash, raw_size
+        )
+
+    if (
+        str(metadata.get("raw_xml_sha256", "")).casefold() != raw_hash
+        or metadata.get("raw_xml_size_bytes") != raw_size
+    ):
+        return SourceProvenance(
+            "CACHE", "", "METADATA_HASH_MISMATCH", processed_at, raw_hash, raw_size
+        )
+
+    source_retrieved_at = str(metadata.get("source_retrieved_at", "")).strip()
+    source_datetime = _parse_utc_iso8601(source_retrieved_at)
+    if (
+        metadata.get("schema_version") != RAW_METADATA_SCHEMA_VERSION
+        or metadata.get("source_timestamp_basis") != "HTTP_FETCH"
+        or metadata.get("api_target") != expected_api_target
+        or metadata.get("requested_title") != expected_requested_title
+        or source_datetime is None
+        # 로컬 시계 오차를 조금 허용하되 미래의 임의 시각은 신뢰하지 않는다.
+        or source_datetime > datetime.now(timezone.utc) + timedelta(minutes=5)
+    ):
+        return SourceProvenance(
+            "CACHE", "", "INVALID_CACHE_METADATA", processed_at, raw_hash, raw_size
+        )
+
+    return SourceProvenance(
+        "CACHE",
+        source_retrieved_at,
+        "CACHE_METADATA",
+        processed_at,
+        raw_hash,
+        raw_size,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -869,7 +1076,7 @@ def detect_xml_error(root) -> str:
 # 링크 정규화
 # ---------------------------------------------------------------------------
 def normalize_law_link(value: str) -> str:
-    """법제처 응답 파일링크를 절대 URL로 정규화."""
+    """법제처 파일 링크를 안전한 canonical HTTP(S) URL로 정규화한다."""
     if value is None:
         return ""
     v = str(value).strip()
@@ -877,26 +1084,84 @@ def normalize_law_link(value: str) -> str:
         return ""
     # HTML entity 복원
     v = html.unescape(v)
-    # 줄바꿈/내부 공백 정리 (URL 중간 공백이 있으면 +로 변환된 경우 등은 그대로 둠)
+    # HTML 줄바꿈은 제거하되 URL 내부 공백·제어문자·역슬래시는 허용하지 않는다.
     v = v.strip().replace("\r", "").replace("\n", "")
     if not v:
         return ""
+    if (
+        any(
+            character.isspace()
+            or ord(character) < 32
+            or character in '<>"'
+            for character in v
+        )
+        or "\\" in v
+        or re.search(r"%(?![0-9A-Fa-f]{2})", v)
+    ):
+        return ""
 
-    if v.startswith("http://") or v.startswith("https://"):
-        return v
-    if v.startswith("//"):
-        return "https:" + v
-    if v.startswith("/"):
-        return LAW_SITE_ROOT + v
-    if v.startswith("LSW/") or v.startswith("DRF/"):
-        return LAW_SITE_ROOT + "/" + v
-    # 그 외 상대값 → 기본적으로 root 기준으로 붙임
-    return LAW_SITE_ROOT + "/" + v
+    # scheme이 생략된 공식 호스트 표기도 상대경로가 아니라 절대 URL로 해석한다.
+    if re.match(r"^(?:www\.)?law\.go\.kr(?::\d+)?(?:/|$)", v, re.IGNORECASE):
+        v = "https://" + v
+
+    try:
+        if v.startswith("//"):
+            v = "https:" + v
+        else:
+            parsed_input = urlsplit(v)
+            if parsed_input.scheme and parsed_input.scheme.casefold() not in {
+                "http",
+                "https",
+            }:
+                return ""
+            if not parsed_input.scheme:
+                v = urljoin(LAW_SITE_ROOT + "/", v.lstrip("/"))
+
+        parsed = urlsplit(v)
+        scheme = parsed.scheme.casefold()
+        if scheme not in {"http", "https"} or not parsed.hostname:
+            return ""
+        if parsed.username is not None or parsed.password is not None:
+            return ""
+        hostname = parsed.hostname.casefold()
+        port = parsed.port
+    except ValueError:
+        return ""
+
+    # 법제처 공식 호스트의 과거 HTTP 링크는 HTTPS 한 형태로 통일한다.
+    if hostname in {"law.go.kr", "www.law.go.kr"}:
+        if scheme == "http" and port == 80:
+            port = None
+        scheme = "https"
+        hostname = "www.law.go.kr"
+
+    host_for_netloc = f"[{hostname}]" if ":" in hostname else hostname
+    default_port = (scheme == "http" and port == 80) or (
+        scheme == "https" and port == 443
+    )
+    netloc = host_for_netloc if port is None or default_port else f"{host_for_netloc}:{port}"
+    return urlunsplit((scheme, netloc, parsed.path or "/", parsed.query, parsed.fragment))
 
 
 # ---------------------------------------------------------------------------
 # 파서: 공통 보조
 # ---------------------------------------------------------------------------
+def _normalized_link_values(elem, tag_name: str) -> Tuple[List[str], int]:
+    """하위 링크 필드를 모두 보존하고 유효하지 않은 scheme 수를 반환한다."""
+    links: List[str] = []
+    invalid_count = 0
+    for link_element in _find_all(elem, tag_name):
+        raw_value = _text(link_element).strip()
+        if not raw_value:
+            continue
+        normalized = normalize_law_link(raw_value)
+        if normalized:
+            links.append(normalized)
+        else:
+            invalid_count += 1
+    return links, invalid_count
+
+
 def _parse_appendix_block(byp_root) -> Dict[str, Any]:
     """별표 1건의 공통 필드를 dict로 반환."""
     별표번호 = _get_text(byp_root, "별표번호")
@@ -906,9 +1171,15 @@ def _parse_appendix_block(byp_root) -> Dict[str, Any]:
     별표시행일자 = _get_text(byp_root, "별표시행일자")
     별표내용 = _get_text(byp_root, "별표내용")
 
-    파일링크 = normalize_law_link(_get_text(byp_root, "별표서식파일링크"))
-    PDF링크 = normalize_law_link(_get_text(byp_root, "별표서식PDF파일링크"))
-    이미지링크 = normalize_law_link(_get_text(byp_root, "별표서식이미지파일링크"))
+    파일링크목록, 파일오류 = _normalized_link_values(
+        byp_root, "별표서식파일링크"
+    )
+    PDF링크목록, PDF오류 = _normalized_link_values(
+        byp_root, "별표서식PDF파일링크"
+    )
+    이미지링크목록, 이미지오류 = _normalized_link_values(
+        byp_root, "별표서식이미지파일링크"
+    )
 
     # HWP/파일 일반은 파일링크에 통합 (확장자가 다양할 수 있음)
     return {
@@ -918,9 +1189,14 @@ def _parse_appendix_block(byp_root) -> Dict[str, Any]:
         "별표제목": 별표제목,
         "별표시행일자": 별표시행일자,
         "별표내용": 별표내용,
-        "별표서식파일링크": 파일링크,
-        "별표서식PDF파일링크": PDF링크,
-        "별표서식이미지파일링크": 이미지링크,
+        # 단일 값 key는 기존 호출자의 호환성을 위해 첫 링크를 유지한다.
+        "별표서식파일링크": 파일링크목록[0] if 파일링크목록 else "",
+        "별표서식PDF파일링크": PDF링크목록[0] if PDF링크목록 else "",
+        "별표서식이미지파일링크": 이미지링크목록[0] if 이미지링크목록 else "",
+        "별표서식파일링크목록": 파일링크목록,
+        "별표서식PDF파일링크목록": PDF링크목록,
+        "별표서식이미지파일링크목록": 이미지링크목록,
+        "_invalid_link_count": 파일오류 + PDF오류 + 이미지오류,
     }
 
 
@@ -1116,22 +1392,35 @@ def parse_admrul_xml(xml_text: str) -> Dict[str, Any]:
     for byp in appendix_roots:
         parsed["appendices"].append(_parse_appendix_block(byp))
 
-    # 첨부파일 (행정규칙에서는 첨부파일명/첨부파일링크가 페어로 다수 등장 가능)
-    att_units = _find_all(root, "첨부파일단위") or _find_all(root, "첨부파일")
-    if att_units:
-        for au in att_units:
-            name = _get_text(au, "첨부파일명")
-            link = normalize_law_link(_get_text(au, "첨부파일링크"))
-            if name or link:
-                parsed["attachments"].append({"첨부파일명": name, "첨부파일링크": link})
-    else:
-        names = [_text(e) for e in _find_all(root, "첨부파일명") if _text(e)]
-        links = [normalize_law_link(_text(e)) for e in _find_all(root, "첨부파일링크") if _text(e)]
-        for i in range(max(len(names), len(links))):
-            parsed["attachments"].append({
-                "첨부파일명": names[i] if i < len(names) else "",
-                "첨부파일링크": links[i] if i < len(links) else "",
-            })
+    # 첨부파일 컨테이너 하나에 여러 이름/링크 쌍이 들어오는 응답을 모두 보존한다.
+    att_containers = _find_all(root, "첨부파일단위")
+    if not att_containers:
+        att_containers = _find_all(root, "첨부파일")
+    if not att_containers and (
+        _find_all(root, "첨부파일명") or _find_all(root, "첨부파일링크")
+    ):
+        att_containers = [root]
+
+    for container in att_containers:
+        names = [
+            _text(element).strip()
+            for element in _find_all(container, "첨부파일명")
+        ]
+        raw_links = [
+            _text(element).strip()
+            for element in _find_all(container, "첨부파일링크")
+        ]
+        for index in range(max(len(names), len(raw_links))):
+            name = names[index] if index < len(names) else ""
+            raw_link = raw_links[index] if index < len(raw_links) else ""
+            link = normalize_law_link(raw_link) if raw_link else ""
+            invalid_link_count = 1 if raw_link and not link else 0
+            if name or link or invalid_link_count:
+                parsed["attachments"].append({
+                    "첨부파일명": name,
+                    "첨부파일링크": link,
+                    "_invalid_link_count": invalid_link_count,
+                })
 
     # 개정문/제개정이유
     for e in _find_all(root, "개정문내용"):
@@ -1240,11 +1529,45 @@ def parse_and_validate_xml(api_target: str, xml_text: str) -> Dict[str, Any]:
 # Markdown 렌더링
 # ---------------------------------------------------------------------------
 # --- 정규화 / 구조 감지 (converter.py 규칙 이식) ---
-_DOT_NORMALIZE = str.maketrans({
-    "·": "ㆍ",  # · Middle Dot -> ㆍ Hangul Letter Araea
-    "・": "ㆍ",  # ・ Katakana Middle Dot -> ㆍ
-    "･": "ㆍ",  # ･ Halfwidth Katakana Middle Dot -> ㆍ
+# raw XML은 API 원문 문자를 보존한다. Markdown은 검색과 청킹을 위해
+# NFKC_SEARCH_V1 문자 정규화를 항상 적용한다.
+_SEARCH_MIDDLE_DOTS = str.maketrans({
+    "ㆍ": "·",  # Hangul Letter Araea -> 검색 토큰 경계용 Middle Dot
+    "・": "·",  # Katakana Middle Dot -> Middle Dot
+    "･": "·",  # Halfwidth Katakana Middle Dot -> Middle Dot
 })
+_CIRCLED_LEGAL_MARKERS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+_CIRCLED_MARKER_SPLIT_RE = re.compile(
+    f"([{re.escape(_CIRCLED_LEGAL_MARKERS)}])"
+)
+_SEARCH_UNIT_SPACE_RE = re.compile(
+    r"(?<=\d)[ \t]+(?=(?:mm|m3|m/s|°C))"
+)
+_SEARCH_PROTECTED_INLINE_RE = re.compile(
+    r"(</?img\b[^>]*>|[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']+)",
+    re.IGNORECASE,
+)
+_SEARCH_QUOTED_IMG_ALT_RE = re.compile(
+    r"(\balt\s*=\s*)([\"'])(.*?)\2",
+    re.IGNORECASE,
+)
+_SEARCH_LITERAL_INLINE_LINK_RE = re.compile(
+    r"(?<!\\)(!?)\[([^\]\n]+)\]\(([^)\n]*)\)"
+)
+_SEARCH_LITERAL_EMPHASIS_RE = re.compile(
+    r"(?<!\\)(\*{1,3}|_{1,3}|~{2})(?=\S)(.+?)(?<=\S)\1"
+)
+_SEARCH_LITERAL_HTML_RE = re.compile(r"<(?=/?[A-Za-z])", re.IGNORECASE)
+_NORMALIZATION_PROTECTED_FIELD_SUFFIXES = (
+    "ID",
+    "코드",
+    "번호",
+    "일자",
+    "연락처",
+    "링크",
+    "URL",
+    "url",
+)
 
 # 편/장/절/관(및 드문 항/속/목) 구조 헤더 감지. '제N장 …' / '제N편 …' 형태.
 _STRUCTURE_RE = re.compile(
@@ -1270,8 +1593,8 @@ _CIRCLED_RE = re.compile(r"^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰
 # (전수 조사 결과 이 형태는 NFTC/NFPC 문서에만 존재하여 오적용 위험이 없다.)
 _NFTC_LEAD_RE = re.compile(r"^\d+(?:\.\d+)*\.?(?:\s|$)")
 
-# 구조 헤더 레벨(converter.py와 동일): 편=#, 장=##, 절=###, 관=####
-_STRUCTURE_LEVEL = {"편": "#", "장": "##", "절": "###", "관": "####"}
+# 실제 존재하는 상위 구조만 압축해 H2부터 연속으로 배치한다.
+_STRUCTURE_ORDER = {"편": 0, "장": 1, "절": 2, "관": 3}
 _CAPTION_STRUCTURE_TYPES = {"항", "속", "목"}
 
 # 별표·서식 원문은 Markdown이 아니므로, 원문 문자가 우연히 Markdown 문법으로
@@ -1301,14 +1624,192 @@ _APPENDIX_LITERAL_INLINE_RE = re.compile(r"(?<!\\)([*_`])")
 # 좁은 범위만 중화한다. 숫자 목록, 들여쓰기 코드블록, 백틱 및 API의 img 태그가
 # 실제 의미와 다르게 해석되는 경우만 대상으로 삼는다.
 _REVISION_ORDERED_LIST_RE = re.compile(r"^([ ]{0,3}\d{1,9})([.)])([ \t]+)")
-_REVISION_IMAGE_TAG_RE = re.compile(r"<img\b([^>]*)>", re.IGNORECASE)
-_REVISION_IMAGE_CLOSE_RE = re.compile(r"</img\s*>", re.IGNORECASE)
+_EMBEDDED_IMAGE_TAG_RE = re.compile(r"<img\b([^>]*)>", re.IGNORECASE)
+_EMBEDDED_IMAGE_CLOSE_RE = re.compile(r"</img\s*>", re.IGNORECASE)
 _REVISION_LITERAL_BACKTICK_RE = re.compile(r"(?<!\\)`")
 
 
 def normalize_dots(s: str) -> str:
-    """가운뎃점 변형(·・･)을 표준 ㆍ(U+318D)로 통일."""
-    return (s or "").translate(_DOT_NORMALIZE)
+    """하위 호환용 도우미. 기본 출력에서는 원문 점 문자를 그대로 둔다."""
+    return s or ""
+
+
+def normalize_search_text(text: str) -> str:
+    """검색용 NFKC 프로필을 텍스트 한 덩어리에 적용한다.
+
+    법적 열거 표지 ①~⑳은 구조 손실을 막기 위해 보존한다. 순수 NFKC가
+    ``ㆍ``를 자모 ``ᆞ``로, ``㎧``를 ``m∕s``로 만드는 한계를 보정하고,
+    사용자가 예로 든 네 단위는 숫자와 붙여 ``65mm`` 식 검색도 가능하게 한다.
+    NFKC가 원문에 없던 Markdown/HTML 구조를 만드는 경우에는 리터럴로 남긴다.
+    """
+    source = str(text or "")
+    if not source:
+        return ""
+
+    def normalize_literal_segment(segment: str) -> str:
+        normalized_parts: List[str] = []
+        for legal_segment in _CIRCLED_MARKER_SPLIT_RE.split(segment):
+            if legal_segment in _CIRCLED_LEGAL_MARKERS:
+                normalized_parts.append(legal_segment)
+                continue
+            converted = legal_segment.translate(_SEARCH_MIDDLE_DOTS)
+            converted = unicodedata.normalize("NFKC", converted).replace("∕", "/")
+            normalized_parts.append(converted.translate(_SEARCH_MIDDLE_DOTS))
+        normalized_segment = "".join(normalized_parts)
+        normalized_segment = _SEARCH_UNIT_SPACE_RE.sub("", normalized_segment)
+        # 이 구간에는 원래 ASCII img 태그와 URL이 없다. NFKC로 새로 생긴
+        # 태그를 포함한 나머지 raw HTML은 모두 리터럴로 둔다.
+        return _SEARCH_LITERAL_HTML_RE.sub("&lt;", normalized_segment)
+
+    output: List[str] = []
+    for inline_segment in _SEARCH_PROTECTED_INLINE_RE.split(source):
+        if not inline_segment:
+            continue
+        if _SEARCH_PROTECTED_INLINE_RE.fullmatch(inline_segment):
+            if re.match(r"<img\b", inline_segment, re.IGNORECASE):
+                inline_segment = _SEARCH_QUOTED_IMG_ALT_RE.sub(
+                    lambda match: (
+                        match.group(1)
+                        + match.group(2)
+                        + normalize_literal_segment(match.group(3))
+                        + match.group(2)
+                    ),
+                    inline_segment,
+                )
+            output.append(inline_segment)
+            continue
+
+        output.append(normalize_literal_segment(inline_segment))
+
+    normalized = "".join(output)
+
+    # 원문 텍스트에 우연히 들어 있던 Markdown 링크는 리터럴로 남긴다.
+    # 공식 이미지·파일 링크는 이 함수 실행 뒤 렌더러가 별도로 생성한다.
+    normalized = _SEARCH_LITERAL_INLINE_LINK_RE.sub(
+        lambda match: f"{match.group(1)}\\[{match.group(2)}]({match.group(3)})",
+        normalized,
+    )
+    normalized = _SEARCH_LITERAL_EMPHASIS_RE.sub(
+        lambda match: (
+            "".join("\\" + character for character in match.group(1))
+            + match.group(2)
+            + match.group(1)
+        ),
+        normalized,
+    )
+
+    source_lines = source.split("\n")
+    normalized_lines = normalized.split("\n")
+    if len(source_lines) != len(normalized_lines):
+        return normalized
+
+    block_patterns = (
+        re.compile(r"^ {0,3}#{1,6}(?:\s|$)"),
+        re.compile(r"^ {0,3}[-+*](?:\s|$)"),
+        re.compile(r"^ {0,3}>(?:\s|$)"),
+        re.compile(r"^ {0,3}(?:`{3,}|~{3,})"),
+        re.compile(
+            r"^ {0,3}(?:=+|-+|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$"
+        ),
+        re.compile(
+            r"^ {0,3}\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$"
+        ),
+    )
+    ordered_pattern = re.compile(r"^([ \t]*\d{1,9})([.)])(?=[ \t])")
+    link_definition_pattern = re.compile(
+        r"^([ \t]*)(\[[^\]]+\])(:[ \t]*\S)"
+    )
+    flat_structure_pattern = re.compile(
+        r"^[ \t]*(?:"
+        r"[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳](?=[ \t])|"
+        r"\d{1,9}[.)](?=[ \t])|"
+        r"[가-힣](?:의\d+)?\.(?=[ \t])"
+        r")"
+    )
+    safe_lines: List[str] = []
+    for source_line, normalized_line in zip(source_lines, normalized_lines):
+        source_indent_match = re.match(r"^[^\S\r\n]*", source_line)
+        normalized_indent_match = re.match(r"^[ \t]*", normalized_line)
+        source_indent = source_indent_match.group(0) if source_indent_match else ""
+        normalized_indent = (
+            normalized_indent_match.group(0) if normalized_indent_match else ""
+        )
+        normalized_is_structure = (
+            flat_structure_pattern.match(normalized_line) is not None
+            or any(pattern.match(normalized_line) for pattern in block_patterns)
+        )
+        if (
+            normalized_is_structure
+            and any(character not in " \t" for character in source_indent)
+        ):
+            # NFKC가 전각 공백을 ASCII 들여쓰기로 바꾸면서 평문을 항·호·목이나
+            # Markdown 블록으로 새로 해석하지 않도록 원래 선두 공백만 복원한다.
+            normalized_line = source_indent + normalized_line[len(normalized_indent):]
+
+        if (
+            ordered_pattern.match(normalized_line)
+            and not ordered_pattern.match(source_line)
+        ):
+            normalized_line = ordered_pattern.sub(r"\1\\\2", normalized_line, count=1)
+        elif (
+            link_definition_pattern.match(normalized_line)
+            and not link_definition_pattern.match(source_line)
+        ):
+            normalized_line = link_definition_pattern.sub(
+                r"\1\\\2\3", normalized_line, count=1
+            )
+        else:
+            for pattern in block_patterns:
+                if pattern.match(normalized_line) and not pattern.match(source_line):
+                    marker_position = len(normalized_line) - len(
+                        normalized_line.lstrip(" ")
+                    )
+                    normalized_line = (
+                        normalized_line[:marker_position]
+                        + "\\"
+                        + normalized_line[marker_position:]
+                    )
+                    break
+        safe_lines.append(normalized_line)
+    return "\n".join(safe_lines)
+
+
+def _normalization_edit_count(source: str, normalized: str) -> int:
+    """정규화로 달라진 텍스트 필드 1건을 센다."""
+    return int(source != normalized)
+
+
+def normalize_parsed_for_search(
+    parsed: Dict[str, Any],
+) -> Tuple[Dict[str, Any], int]:
+    """URL·식별자·날짜는 보존하고 문서 텍스트만 검색용으로 복제한다."""
+    normalized = copy.deepcopy(parsed)
+    change_count = 0
+
+    def visit(value: Any, field_name: str = "") -> Any:
+        nonlocal change_count
+        if isinstance(value, dict):
+            for key, item in list(value.items()):
+                value[key] = visit(item, str(key))
+            return value
+        if isinstance(value, list):
+            return [visit(item, field_name) for item in value]
+        if isinstance(value, tuple):
+            return tuple(visit(item, field_name) for item in value)
+        if not isinstance(value, str):
+            return value
+        if (
+            field_name.startswith("_")
+            or "링크" in field_name
+            or field_name.casefold() in {"src", "href", "url"}
+            or field_name.endswith(_NORMALIZATION_PROTECTED_FIELD_SUFFIXES)
+        ):
+            return value
+        converted = normalize_search_text(value)
+        change_count += _normalization_edit_count(value, converted)
+        return converted
+
+    return visit(normalized), change_count
 
 
 def normalize_appendix_blank_lines(text: str) -> str:
@@ -1353,6 +1854,9 @@ def neutralize_appendix_markdown(text: str) -> str:
     if not text:
         return ""
 
+    # 생성한 이미지 Markdown까지 원문 리터럴로 오인해 이스케이프하지 않도록
+    # 먼저 안전한 토큰으로 보관하고 나머지 원문만 중화한다.
+    text, embedded_images = _hold_embedded_images(text)
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     neutralized: List[str] = []
 
@@ -1422,31 +1926,268 @@ def neutralize_appendix_markdown(text: str) -> str:
         line = _APPENDIX_LITERAL_INLINE_RE.sub(r"\\\1", line)
         neutralized.append(line)
 
-    return "\n".join(neutralized)
+    return _restore_embedded_images("\n".join(neutralized), embedded_images)
 
 
-def _revision_image_text(attributes: str) -> str:
-    """API의 img 태그 속성을 NotebookLM이 읽을 수 있는 텍스트로 바꾼다."""
+def _embedded_image_attributes(attributes: str) -> Dict[str, str]:
+    """허용한 img 속성만 HTML entity를 복원해 반환한다."""
     values: Dict[str, str] = {}
     for match in re.finditer(
-        r"\b(src|id|alt)\s*=\s*(?:([\"'])(.*?)\2|([^\s\"'=<>`]+))",
+        r"(?:^|\s)(src|id|alt)\s*=\s*"
+        r"(?:([\"'])(.*?)\2|([^\s\"'=<>`]+))",
         attributes,
         re.IGNORECASE,
     ):
-        values[match.group(1).lower()] = html.unescape(match.group(3) or match.group(4) or "")
+        value = html.unescape(match.group(3) or match.group(4) or "")
+        values[match.group(1).lower()] = re.sub(r"\s+", " ", value).strip()
+    return values
 
+
+def _official_embedded_image_flseq(url: str) -> str:
+    """자동 표시를 허용한 법제처 이미지 URL에서 숫자 flSeq를 반환한다."""
+    if not url:
+        return ""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme.casefold() != "https"
+        or (parsed.hostname or "").casefold() not in {"law.go.kr", "www.law.go.kr"}
+        or parsed.path.casefold() not in {"/fldownload.do", "/lsw/fldownload.do"}
+    ):
+        return ""
+    values = parse_qs(parsed.query, keep_blank_values=True).get("flSeq", [])
+    if len(values) != 1 or not re.fullmatch(r"[0-9]+", values[0]):
+        return ""
+    return values[0]
+
+
+def _embedded_image_reference(values: Dict[str, str]) -> Tuple[str, str, str]:
+    """img 속성에서 표시 URL, 이미지 ID, 의미 있는 대체 텍스트를 만든다."""
     src = normalize_law_link(values.get("src", ""))
-    if src:
-        return f"이미지 원문(URL: {src})"
-
     image_id = values.get("id", "").strip()
-    if not image_id:
-        alt = values.get("alt", "").strip()
-        image_id_match = re.search(r"\d+", alt)
-        image_id = image_id_match.group(0) if image_id_match else ""
+    alt = values.get("alt", "").strip()
+    source_flseq = _official_embedded_image_flseq(src)
+
+    # alt="img123"은 ID의 기계적 반복이므로 설명으로 중복 기록하지 않는다.
+    alt_id_match = re.fullmatch(r"img\s*([0-9]+)", alt, re.IGNORECASE)
+    if source_flseq:
+        # 선택한 src가 가장 직접적인 근거이므로 id/alt가 충돌해도 src의 flSeq를 쓴다.
+        image_id = source_flseq
+    elif not image_id:
+        image_id = alt_id_match.group(1) if alt_id_match else ""
+    if alt_id_match:
+        alt = ""
+
+    # 법제처 본문의 id는 flSeq 값이다. src가 생략된 응답도 공식 다운로드 URL로
+    # 복원하되, 임의 문자열을 쿼리에 넣지 않도록 숫자 ID만 허용한다.
+    if not src and re.fullmatch(r"[0-9]+", image_id):
+        src = EMBEDDED_IMAGE_DOWNLOAD_URL.format(image_id)
+    elif source_flseq:
+        # /LSW 유무와 부가 쿼리를 한 canonical 주소로 통일한다.
+        src = EMBEDDED_IMAGE_DOWNLOAD_URL.format(source_flseq)
+
+    return src, image_id, alt
+
+
+def _markdown_image_alt(text: str) -> str:
+    """대체 텍스트가 이미지 링크의 Markdown 구조를 깨지 않게 이스케이프한다."""
+    escaped = html.escape(re.sub(r"\s+", " ", text).strip(), quote=False)
+    escaped = escaped.replace("\\", "\\\\")
+    for character in ("[", "]", "*", "_", "`"):
+        escaped = escaped.replace(character, "\\" + character)
+    return escaped
+
+
+def _embedded_image_text(attributes: str) -> str:
+    """API의 img 태그를 표시 가능한 이미지와 원문 확인 링크로 바꾼다."""
+    values = _embedded_image_attributes(attributes)
+    src, image_id, alt = _embedded_image_reference(values)
+    safe_image_id = image_id if re.fullmatch(r"[0-9]+", image_id) else ""
+
+    if src and _official_embedded_image_flseq(src):
+        description = alt or "법령정보센터 원문 이미지"
+        if safe_image_id and not alt:
+            description += f" {safe_image_id}"
+        title = "국가법령정보센터 원문 이미지"
+        link_label = "원문 이미지 열기"
+        if safe_image_id:
+            title += f" (ID: {safe_image_id})"
+            link_label += f" (ID: {safe_image_id})"
+        return (
+            f'![{_markdown_image_alt(description)}](<{src}> "{title}") '
+            f'([{link_label}](<{src}>))'
+        )
+
+    if src:
+        # 임의 외부 호스트를 Markdown 이미지로 자동 요청하지 않는다. URL 자체는
+        # 사람이 명시적으로 확인할 수 있도록 안전한 링크로 보존한다.
+        details: List[str] = []
+        if image_id:
+            details.append(f"ID: {_markdown_image_alt(image_id)}")
+        if alt:
+            details.append(f"설명: {_markdown_image_alt(alt)}")
+        detail_text = f" ({', '.join(details)})" if details else ""
+        return f"[원문 이미지 열기](<{src}>){detail_text}"
+
+    details: List[str] = []
     if image_id:
-        return f"이미지 참조(ID: {image_id})"
+        details.append(f"ID: {_markdown_image_alt(image_id)}")
+    if alt:
+        details.append(f"설명: {_markdown_image_alt(alt)}")
+    if details:
+        return f"이미지 참조({', '.join(details)})"
     return "이미지 참조"
+
+
+def _hold_embedded_images(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """img 태그를 Markdown 중화 과정에서 안전한 임시 토큰으로 보관한다."""
+    replacements: List[Tuple[str, str]] = []
+    converted = _EMBEDDED_IMAGE_CLOSE_RE.sub("", text)
+    token_prefix = f"\ue000KLMIMAGE{uuid.uuid4().hex}TOKEN"
+
+    def hold(match: re.Match) -> str:
+        token = f"{token_prefix}{len(replacements)}\ue001"
+        replacements.append((token, _embedded_image_text(match.group(1))))
+        return token
+
+    converted = _EMBEDDED_IMAGE_TAG_RE.sub(hold, converted)
+    for (left, _), (right, _) in zip(replacements, replacements[1:]):
+        converted = converted.replace(left + right, left + " / " + right)
+    return converted, replacements
+
+
+def _restore_embedded_images(
+    text: str, replacements: List[Tuple[str, str]]
+) -> str:
+    """임시 토큰을 생성한 이미지 Markdown으로 되돌린다."""
+    for token, replacement in replacements:
+        text = text.replace(token, replacement)
+    return text
+
+
+def normalize_embedded_images(text: str) -> str:
+    """모든 법률 텍스트의 img 태그를 이미지와 원문 링크로 정규화한다."""
+    if not text:
+        return ""
+    converted, replacements = _hold_embedded_images(text)
+    return _restore_embedded_images(converted, replacements)
+
+
+def _normalize_legal_text(text: str) -> str:
+    """원문 점 문자를 보존하며 이미지와 리터럴 백틱만 안전하게 렌더한다."""
+    normalized = normalize_embedded_images(normalize_dots(text or ""))
+    return _REVISION_LITERAL_BACKTICK_RE.sub(r"\`", normalized)
+
+
+def _appendix_link_values(appendix: Dict[str, Any], field_name: str) -> List[str]:
+    """v2 목록 필드를 우선하고 v1 단일 필드도 호환한다."""
+    list_value = appendix.get(f"{field_name}목록")
+    if isinstance(list_value, list):
+        values = list_value
+    else:
+        scalar = appendix.get(field_name, "")
+        values = [scalar] if scalar else []
+    return [str(value).strip() for value in values if str(value or "").strip()]
+
+
+def _unique_normalized_links(values: List[str]) -> List[str]:
+    """Markdown 표시용 canonical URL을 원래 순서대로 중복 제거한다."""
+    unique: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = normalize_law_link(value)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique.append(normalized)
+    return unique
+
+
+def _walk_text_values(value: Any):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).startswith("_"):
+                continue
+            yield from _walk_text_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _walk_text_values(item)
+    elif isinstance(value, str):
+        yield value
+
+
+def _document_link_stats(parsed: Dict[str, Any]) -> Dict[str, int]:
+    """실제로 보존·정규화 가능한 URL과 본문 이미지 참조를 문서 단위로 센다."""
+    pdf_links: List[str] = []
+    file_links: List[str] = []
+    appendix_image_links: List[str] = []
+    attachment_links: List[str] = []
+    invalid_count = 0
+
+    def collect(values: List[str], destination: List[str]) -> None:
+        nonlocal invalid_count
+        for raw_value in values:
+            normalized = normalize_law_link(raw_value)
+            if normalized:
+                destination.append(normalized)
+            elif str(raw_value or "").strip():
+                invalid_count += 1
+
+    for appendix in parsed.get("appendices") or []:
+        collect(
+            _appendix_link_values(appendix, "별표서식PDF파일링크"),
+            pdf_links,
+        )
+        collect(
+            _appendix_link_values(appendix, "별표서식파일링크"),
+            file_links,
+        )
+        collect(
+            _appendix_link_values(appendix, "별표서식이미지파일링크"),
+            appendix_image_links,
+        )
+        invalid_count += int(appendix.get("_invalid_link_count", 0) or 0)
+
+    for attachment in parsed.get("attachments") or []:
+        raw_link = str(attachment.get("첨부파일링크", "") or "").strip()
+        if raw_link:
+            collect([raw_link], attachment_links)
+        invalid_count += int(attachment.get("_invalid_link_count", 0) or 0)
+
+    embedded_reference_count = 0
+    embedded_links: List[str] = []
+    for text_value in _walk_text_values(parsed):
+        for match in _EMBEDDED_IMAGE_TAG_RE.finditer(text_value):
+            embedded_reference_count += 1
+            attributes = _embedded_image_attributes(match.group(1))
+            raw_src = attributes.get("src", "").strip()
+            if raw_src and not normalize_law_link(raw_src):
+                invalid_count += 1
+            embedded_src, _, _ = _embedded_image_reference(attributes)
+            if embedded_src:
+                embedded_links.append(embedded_src)
+
+    all_links = (
+        pdf_links
+        + file_links
+        + appendix_image_links
+        + attachment_links
+        + embedded_links
+    )
+    unique_count = len(set(all_links))
+    return {
+        "appendix_pdf_link_count": len(pdf_links),
+        "appendix_file_link_count": len(file_links),
+        "appendix_image_link_count": len(appendix_image_links),
+        "attachment_link_count": len(attachment_links),
+        "embedded_image_reference_count": embedded_reference_count,
+        "embedded_image_link_count": len(embedded_links),
+        "normalized_links_count": len(all_links),
+        "unique_normalized_link_count": unique_count,
+        "duplicate_link_count": len(all_links) - unique_count,
+        "invalid_link_count": invalid_count,
+    }
 
 
 def neutralize_revision_markdown(text: str) -> str:
@@ -1455,22 +2196,14 @@ def neutralize_revision_markdown(text: str) -> str:
     원래의 줄바꿈과 행 내부 공백은 유지한다. 문서 시작 또는 빈 행 다음의
     탭/공백 4칸 이상 들여쓰기는 코드블록이 되지 않게 첫 칸만 숫자 엔터티로
     바꾸고, CommonMark 숫자 목록과 백틱은 백슬래시로 이스케이프한다.
-    API가 텍스트 안에 넣은 img 태그는 URL 또는 이미지 ID를 남기는 평문으로
-    변환한다. 의도된 하이픈 목록과 법령식 '가.', '(1)' 표기는 그대로 둔다.
+    API가 텍스트 안에 넣은 img 태그는 원문 URL을 가진 Markdown 이미지와
+    확인 링크로 변환한다. 의도된 하이픈 목록과 법령식 '가.', '(1)' 표기는
+    그대로 둔다.
     """
     if not text:
         return ""
 
-    converted = _REVISION_IMAGE_CLOSE_RE.sub("", text)
-    converted = _REVISION_IMAGE_TAG_RE.sub(
-        lambda match: _revision_image_text(match.group(1)), converted
-    )
-    # 한 행에 img 태그가 연속된 API 응답은 각 이미지 참조를 분리해 읽게 한다.
-    converted = re.sub(
-        r"\)(?=이미지 (?:원문|참조)\()",
-        ") / ",
-        converted,
-    )
+    converted = normalize_embedded_images(text)
 
     lines = converted.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     neutralized: List[str] = []
@@ -1543,7 +2276,7 @@ def _render_article_reference_lines(reference: str) -> List[str]:
     API가 후속 참고자료에 붙이는 탭 들여쓰기를 제거하고 모든 내용 줄에
     인용문 표식을 붙인다. 원문의 빈 줄은 빈 인용문 줄로 유지한다.
     """
-    ref = normalize_dots((reference or "").strip())
+    ref = _normalize_legal_text((reference or "").strip())
     if not ref:
         return []
 
@@ -1563,8 +2296,8 @@ def _render_article_reference_lines(reference: str) -> List[str]:
 def _render_nftc_lines(content: str, ref: str = "") -> List[str]:
     """NFTC/NFPC 숫자 체계 본문(한 덩어리)을 헤더 계층으로 승격해 렌더한다.
 
-    - 깊이 1('1. 일반사항')  -> #####  (조 상당 대분류)
-    - 깊이 2('1.1 적용범위')  -> ###### (절 상당 중분류)
+    - 깊이 1('1. 일반사항')  -> ##  (대분류)
+    - 깊이 2('1.1 적용범위')  -> ### (중분류)
     - 깊이 3 이상('1.1.1 …')  -> 번호를 유지한 본문(실제 규정 문장)
     빈 줄로 구분된 문단 단위로 처리하며, 번호가 없는 문단은 그대로 본문으로 둔다.
     """
@@ -1577,7 +2310,7 @@ def _render_nftc_lines(content: str, ref: str = "") -> List[str]:
         depth = (m.group(1).count(".") + 1) if (m and _NFTC_LEAD_RE.match(block)) else 0
         if depth in (1, 2):
             first, _, rest = block.partition("\n")
-            hdr = "#####" if depth == 1 else "######"
+            hdr = "##" if depth == 1 else "###"
             lines.append(f"{hdr} {first.strip()}")
             lines.append("")
             if rest.strip():
@@ -1594,17 +2327,20 @@ def _render_nftc_lines(content: str, ref: str = "") -> List[str]:
 
 
 def _render_law_article_lines(
-    art: Dict[str, Any], *, flat_legal_rules: bool = False
+    art: Dict[str, Any], *, flat_legal_rules: bool = False,
+    heading_level: int = 2,
+    structure_heading_level: Optional[int] = None,
 ) -> List[str]:
     """법령/행정규칙 조문 1건을 Markdown 라인 목록으로 렌더한다(converter.py 규칙).
 
     - 조문여부='전문'이면서 조문내용이 '제N장 …' 형태면 편/장/절/관 헤더로 승격한다.
       (조문번호는 배치 키일 뿐이므로 '제N조' 헤더로 만들지 않는다.)
-    - 조 헤더는 '##### 제N조 (제목)'. 조문내용의 중복 '제N조(제목)' 접두어는 제거한다.
+    - 조 헤더는 실제 편/장/절/관 깊이에 따라 H2~H6. 조문내용의 중복
+      '제N조(제목)' 접두어는 제거한다.
     - 항은 '**번호** 내용', 호는 2칸 들여쓰기 'N\\.', 목은 4칸 들여쓰기 '가\\.'로
       조판하고, 목내용의 줄 시작 'N)'도 'N\\)'로 바꾸어 Markdown 자동
       순서목록화를 방지한다.
-    - 가운뎃점은 ㆍ로 통일하고, 호/목 라인은 수평 공백을 단일화한다.
+    - 원문 점 문자를 보존하고, 호/목 라인은 수평 공백을 단일화한다.
     - 조문참고자료는 인용문으로 보존한다(데이터 유실 방지).
     - flat_legal_rules=True이면 XML 구조 없이 조문내용에 포함된 항ㆍ호ㆍ목
       표지도 같은 규칙으로 조판한다.
@@ -1614,16 +2350,16 @@ def _render_law_article_lines(
     branch = (art.get("조문가지번호") or "").strip()
     kind = (art.get("조문여부") or "").strip()
     title = (art.get("조문제목") or "").strip()
-    content = normalize_dots((art.get("조문내용") or "").strip())
+    content = _normalize_legal_text((art.get("조문내용") or "").strip())
     inferred_prefix_end: Optional[int] = None
 
     # 편/장/절/관 등 구조 헤더 감지
     match = _STRUCTURE_RE.match(content) if (not title and content) else None
     if match and (kind == "전문" or not kind):
         st = match.group(1)
-        level = _STRUCTURE_LEVEL.get(st)
-        if level:
-            lines.append(f"{level} {content}")
+        if st in _STRUCTURE_ORDER:
+            level = max(2, min(structure_heading_level or heading_level, 6))
+            lines.append(f"{'#' * level} {content}")
             lines.append("")
             return lines
         if st in _CAPTION_STRUCTURE_TYPES:
@@ -1641,16 +2377,13 @@ def _render_law_article_lines(
     # NFTC/NFPC 화재안전기술기준: 조문번호·항이 없고 본문이 '1. / 1.1 …' 숫자 체계로
     # 시작하면 번호 체계를 헤더 계층으로 승격한다(다른 문서에는 없는 형태).
     if not number and not (art.get("항") or []) and _NFTC_LEAD_RE.match(content):
-        ref = normalize_dots((art.get("조문참고자료") or "").strip())
+        ref = _normalize_legal_text((art.get("조문참고자료") or "").strip())
         return _render_nftc_lines(content, ref)
 
     # 조문번호 필드가 비어 있는 일부 행정규칙: 조문내용 앞의 '제N조(제목)'에서
     # 번호·가지·제목을 보강한다(접두어는 아래 공통 로직에서 제거되므로 유실되지 않는다).
     if not number:
-        if flat_legal_rules:
-            m = _FLAT_ADMRUL_JO_HEADING_RE.match(content)
-        else:
-            m = re.match(r"^제(\d+)조(?:의(\d+))?\s*(?:\(([^)]*)\))?\s*", content)
+        m = _FLAT_ADMRUL_JO_HEADING_RE.match(content)
         if m:
             number = m.group(1)
             if m.group(2):
@@ -1662,8 +2395,9 @@ def _render_law_article_lines(
     # 조 헤더 (번호가 있을 때만 '제N조'. 번호가 없고 제목만 있으면 제목을 헤더로,
     # 번호·제목이 모두 없으면 — 폐지 고시 등 단일 문장 — 헤더 없이 본문만 출력)
     strip_prefix = True
+    heading_marks = "#" * max(2, min(heading_level, 6))
     if number:
-        heading = f"##### 제{number}조"
+        heading = f"{heading_marks} 제{number}조"
         if branch and branch != "0":
             heading += f"의{branch}"
         if title:
@@ -1671,7 +2405,7 @@ def _render_law_article_lines(
         lines.append(heading)
         lines.append("")
     elif title:
-        lines.append(f"##### {title}")
+        lines.append(f"{heading_marks} {title}")
         lines.append("")
     else:
         strip_prefix = False  # 헤더가 없으니 본문 접두어를 제거하지 않는다
@@ -1692,7 +2426,7 @@ def _render_law_article_lines(
         para_branch = (para.get("항가지번호") or "").strip()
         if para_num and para_branch:
             para_num = f"{para_num}의{para_branch}"
-        para_content = normalize_dots(para.get("항내용") or "")
+        para_content = _normalize_legal_text(para.get("항내용") or "")
         if para_content:
             stripped = _CIRCLED_RE.sub("", para_content.strip())
             if para_num:
@@ -1706,7 +2440,7 @@ def _render_law_article_lines(
             sub_branch = (subpara.get("호가지번호") or "").strip()
             if sub_num and sub_branch:
                 sub_num = f"{sub_num}의{sub_branch}"
-            sub_content = normalize_dots(subpara.get("호내용") or "")
+            sub_content = _normalize_legal_text(subpara.get("호내용") or "")
             if sub_content:
                 s = _normalize_ws_inline(_HO_PREFIX_RE.sub("", sub_content.strip()))
                 if sub_num:
@@ -1719,7 +2453,7 @@ def _render_law_article_lines(
                 item_branch = (item.get("목가지번호") or "").strip()
                 if item_num and item_branch:
                     item_num = f"{item_num}의{item_branch}"
-                item_content = normalize_dots(item.get("목내용") or "")
+                item_content = _normalize_legal_text(item.get("목내용") or "")
                 if item_content:
                     s = _normalize_ws_inline(_MOK_PREFIX_RE.sub("", item_content.strip()))
                     s = _neutralize_mok_child_ordered_lists(s)
@@ -1744,9 +2478,38 @@ def render_law_body(
 ) -> str:
     """조문 리스트를 편/장/절/관 계층이 반영된 본문 Markdown 문자열로 렌더."""
     lines: List[str] = []
+    active_structures: List[str] = []
     for art in articles:
+        raw_content = str(art.get("조문내용", "") or "").strip()
+        structure_match = (
+            _STRUCTURE_RE.match(raw_content)
+            if not str(art.get("조문제목", "") or "").strip()
+            else None
+        )
+        structure_type = (
+            structure_match.group(1)
+            if structure_match
+            and str(art.get("조문여부", "") or "").strip() in ("", "전문")
+            else ""
+        )
+        structure_heading_level: Optional[int] = None
+        if structure_type in _STRUCTURE_ORDER:
+            rank = _STRUCTURE_ORDER[structure_type]
+            active_structures = [
+                existing for existing in active_structures
+                if _STRUCTURE_ORDER[existing] < rank
+            ]
+            structure_heading_level = min(2 + len(active_structures), 6)
+            active_structures.append(structure_type)
+
+        article_heading_level = min(2 + len(active_structures), 6)
         lines.extend(
-            _render_law_article_lines(art, flat_legal_rules=flat_legal_rules)
+            _render_law_article_lines(
+                art,
+                flat_legal_rules=flat_legal_rules,
+                heading_level=article_heading_level,
+                structure_heading_level=structure_heading_level,
+            )
         )
     return "\n".join(lines).strip()
 
@@ -1789,20 +2552,26 @@ def _render_appendix(ap: Dict[str, Any], idx_fallback: int) -> Tuple[str, Dict[s
     else:
         md.append("> 별표내용 없음, 원문 링크 참고")
 
-    파일링크 = ap.get("별표서식파일링크", "")
-    PDF링크 = ap.get("별표서식PDF파일링크", "")
-    이미지링크 = ap.get("별표서식이미지파일링크", "")
+    파일링크목록 = _unique_normalized_links(
+        _appendix_link_values(ap, "별표서식파일링크")
+    )
+    PDF링크목록 = _unique_normalized_links(
+        _appendix_link_values(ap, "별표서식PDF파일링크")
+    )
+    이미지링크목록 = _unique_normalized_links(
+        _appendix_link_values(ap, "별표서식이미지파일링크")
+    )
 
     link_lines: List[str] = []
-    if 파일링크:
-        link_lines.append(f"- 별표서식파일링크: {파일링크}")
-        counts["file"] = 1
-    if PDF링크:
-        link_lines.append(f"- 별표서식PDF파일링크: {PDF링크}")
-        counts["pdf"] = 1
-    if 이미지링크:
-        link_lines.append(f"- 별표서식이미지파일링크: {이미지링크}")
-        counts["image"] = 1
+    for label, links, count_key in (
+        ("별표서식파일링크", 파일링크목록, "file"),
+        ("별표서식PDF파일링크", PDF링크목록, "pdf"),
+        ("별표서식이미지파일링크", 이미지링크목록, "image"),
+    ):
+        for index, link in enumerate(links, start=1):
+            suffix = f" {index}" if len(links) > 1 else ""
+            link_lines.append(f"- {label}{suffix}: {link}")
+        counts[count_key] = len(links)
 
     if link_lines:
         md.append("#### 원문 파일 링크")
@@ -1811,17 +2580,198 @@ def _render_appendix(ap: Dict[str, Any], idx_fallback: int) -> Tuple[str, Dict[s
     return "\n\n".join(md), counts
 
 
-def _uses_admrul_flat_legal_rules(title: str) -> bool:
-    """법령식 평면 조문 표기를 적용할 핵심 행정규칙인지 판별한다.
+def _uses_admrul_flat_legal_rules(parsed: Dict[str, Any]) -> bool:
+    """제목이 아니라 XML의 조문형식 flag와 엄격한 본문 경계로 판별한다."""
+    format_flag = str(parsed.get("조문형식여부", "") or "").strip().casefold()
+    if format_flag == "y":
+        return True
+    if format_flag == "n":
+        return False
 
-    NFTC 및 그 밖의 행정규칙은 각기 다른 번호 체계를 가지므로 제외한다.
-    """
-    normalized = (title or "").strip()
-    return "NFPC" in normalized or "형식승인 및 제품검사의 기술기준" in normalized
+    # 구형/누락 응답은 실제 '제N조(제목)' 시작만 fallback으로 인정한다.
+    # '제7조제1호', '제7조에 따라' 같은 교차참조는 정규식 경계에서 배제된다.
+    for article in parsed.get("articles") or []:
+        content = str(article.get("조문내용", "") or "").strip()
+        if _FLAT_ADMRUL_JO_HEADING_RE.match(content):
+            return True
+    return False
 
 
-def render_markdown(parsed: Dict[str, Any], api_target: str,
-                    collected_at: str, requested_title: str) -> Tuple[str, Dict[str, int]]:
+def _yaml_string(value: Any) -> str:
+    """YAML 1.1/1.2에서 같은 문자열로 읽히는 안전한 scalar를 만든다."""
+    if value is None or value == "":
+        return "null"
+    rendered = json.dumps(str(value), ensure_ascii=False)
+    return re.sub(
+        r"[\x7f-\x9f\u2028\u2029]",
+        lambda match: f"\\u{ord(match.group(0)):04x}",
+        rendered,
+    )
+
+
+def _frontmatter_metadata(
+    parsed: Dict[str, Any],
+    api_target: str,
+    *,
+    title: str,
+    requested_title: str,
+    collected_at: str,
+    provenance: Optional[SourceProvenance],
+    text_normalization: str,
+) -> List[Tuple[str, Any]]:
+    """본문 문서정보를 대체하는 한글 flat frontmatter를 반환한다."""
+    if api_target == "law":
+        document_type = "법령"
+        document_id = parsed.get("법령ID") or None
+        related_decree_id = None
+        related_rule_id = None
+        authority = parsed.get("소관부처") or None
+        issue_date = format_date(parsed.get("공포일자", "")) or None
+        issue_number = parsed.get("공포번호") or None
+        effective_date = format_date(parsed.get("시행일자", "")) or None
+        current_status = None
+        department = parsed.get("부서명") or None
+        department_contact = parsed.get("부서연락처") or None
+        type_specific = [
+            ("법령명약칭", parsed.get("법령명약칭") or None),
+            ("법종구분", parsed.get("법종구분") or None),
+        ]
+    elif api_target == "admrul":
+        document_type = "행정규칙"
+        document_id = (
+            parsed.get("행정규칙ID")
+            or parsed.get("행정규칙일련번호")
+            or None
+        )
+        related_decree_id = None
+        related_rule_id = None
+        authority = parsed.get("소관부처명") or None
+        issue_date = format_date(parsed.get("발령일자", "")) or None
+        issue_number = parsed.get("발령번호") or None
+        effective_date = format_date(parsed.get("시행일자", "")) or None
+        current_status = parsed.get("현행여부") or None
+        department = parsed.get("담당부서기관명") or None
+        department_contact = parsed.get("전화번호") or None
+        type_specific = [
+            ("행정규칙일련번호", parsed.get("행정규칙일련번호") or None),
+            ("행정규칙종류", parsed.get("행정규칙종류") or None),
+            ("제개정구분명", parsed.get("제개정구분명") or None),
+            ("조문형식여부", parsed.get("조문형식여부") or None),
+        ]
+    elif api_target == "thdCmp":
+        document_type = "3단비교(인용조문, knd=1)"
+        document_id = parsed.get("법령ID") or None
+        related_decree_id = (
+            parsed.get("시행령ID")
+            if parsed.get("시행령ID") not in (None, "", "0") else None
+        )
+        related_rule_id = (
+            parsed.get("시행규칙ID")
+            if parsed.get("시행규칙ID") not in (None, "", "0") else None
+        )
+        # thdCmp 응답에는 신뢰할 소관부처·시행일·현행여부 필드가 없다.
+        authority = None
+        issue_date = None
+        issue_number = None
+        effective_date = None
+        current_status = None
+        department = None
+        department_contact = None
+        type_specific = [
+            ("법령요약정보", parsed.get("법령요약정보") or None),
+            ("시행령명", parsed.get("시행령명") or None),
+            ("시행령요약정보", parsed.get("시행령요약정보") or None),
+            ("시행규칙명", parsed.get("시행규칙명") or None),
+            ("시행규칙요약정보", parsed.get("시행규칙요약정보") or None),
+            ("삼단비교기준", parsed.get("삼단비교기준") or None),
+            ("삼단비교존재여부", parsed.get("삼단비교존재여부") or None),
+        ]
+    else:
+        raise ValueError(f"알 수 없는 api_target: {api_target!r}")
+
+    document_key = f"{api_target}:{document_id}" if document_id else None
+    collected_time = _iso8601_with_offset(collected_at) or None
+    source_mode = provenance.source_mode if provenance else None
+    source_retrieved_at = (
+        _iso8601_with_offset(provenance.source_retrieved_at)
+        if provenance else None
+    ) or None
+    source_timestamp_basis = (
+        provenance.source_timestamp_basis if provenance else None
+    )
+    processed_at = (
+        _iso8601_with_offset(provenance.processed_at)
+        if provenance else None
+    ) or collected_time
+    raw_xml_sha256 = provenance.raw_xml_sha256 if provenance else None
+    api_title = (_api_title(parsed) or "").strip() or None
+
+    metadata = [
+        ("YAML스키마버전", FRONTMATTER_SCHEMA_VERSION),
+        ("제목", title),
+        ("문서유형", document_type),
+        ("API대상", api_target),
+        ("문서ID", document_id),
+        ("문서키", document_key),
+        ("시행령ID", related_decree_id),
+        ("시행규칙ID", related_rule_id),
+        ("조회명칭", requested_title or None),
+        ("응답명칭", api_title),
+        ("소관부처", authority),
+        ("공포·발령일자", issue_date),
+        ("공포·발령번호", issue_number),
+        ("시행일자", effective_date),
+        ("현행여부", current_status),
+        ("담당부서", department),
+        ("담당부서연락처", department_contact),
+    ]
+    metadata.extend(type_specific)
+    metadata.extend([
+        ("소스사용방식", source_mode),
+        ("원문API수신일시", source_retrieved_at),
+        ("원문시각근거", source_timestamp_basis),
+        ("수집일시", collected_time),
+        ("마크다운처리일시", processed_at),
+        ("원문SHA-256", raw_xml_sha256),
+        ("변환기버전", RENDERER_VERSION),
+        ("텍스트정규화", text_normalization),
+    ])
+    return metadata
+
+
+def _render_frontmatter(
+    parsed: Dict[str, Any],
+    api_target: str,
+    *,
+    title: str,
+    requested_title: str,
+    collected_at: str,
+    provenance: Optional[SourceProvenance],
+    text_normalization: str,
+) -> str:
+    metadata = _frontmatter_metadata(
+        parsed,
+        api_target,
+        title=title,
+        requested_title=requested_title,
+        collected_at=collected_at,
+        provenance=provenance,
+        text_normalization=text_normalization,
+    )
+    lines = ["---", ""]
+    lines.extend(f"{key}: {_yaml_string(value)}" for key, value in metadata)
+    lines.extend(["", "---"])
+    return "\n".join(lines)
+
+
+def render_markdown(
+    parsed: Dict[str, Any],
+    api_target: str,
+    collected_at: str,
+    requested_title: str,
+    provenance: Optional[SourceProvenance] = None,
+    text_normalization: str = "none",
+) -> Tuple[str, Dict[str, int]]:
     """Markdown 문자열과 집계용 카운트를 반환.
 
     문서 메타데이터는 모두 API 응답(parsed)에서 가져온다.
@@ -1830,78 +2780,27 @@ def render_markdown(parsed: Dict[str, Any], api_target: str,
     """
     api_title = normalize_dots((_api_title(parsed) or "").strip())
     title = api_title or requested_title or "(제목 없음)"
-    doc_type_label = "법령" if api_target == "law" else "행정규칙"
 
-    parts: List[str] = []
-    parts.append(f"# {title}")
-    parts.append("")
-
-    # 문서정보 (모든 값은 API 응답 XML에서 추출)
-    parts.append("## 문서정보")
-    info_lines = [
-        f"- 문서유형: {doc_type_label}",
-        f"- API target: {api_target}",
-        f"- 조회명칭 LM: {requested_title}",
+    parts: List[str] = [
+        _render_frontmatter(
+            parsed,
+            api_target,
+            title=title,
+            requested_title=requested_title,
+            collected_at=collected_at,
+            provenance=provenance,
+            text_normalization=text_normalization,
+        ),
+        "",
+        f"# {title}",
+        "",
     ]
-    if api_title and api_title != requested_title:
-        info_lines.append(f"- 응답 명칭(요청과 다름): {api_title}")
-    info_lines.append(f"- 수집일시: {collected_at}")
-
-    if parsed.get("type") == "law":
-        if parsed.get("법령ID"):
-            info_lines.append(f"- 법령ID: {parsed.get('법령ID','')}")
-        if api_title:
-            info_lines.append(f"- 법령명_한글: {api_title}")
-        if parsed.get("법령명약칭"):
-            info_lines.append(f"- 법령명약칭: {normalize_dots(parsed.get('법령명약칭',''))}")
-        if parsed.get("법종구분"):
-            info_lines.append(f"- 법종구분: {parsed.get('법종구분','')}")
-        if parsed.get("공포일자"):
-            info_lines.append(f"- 공포일자: {format_date(parsed.get('공포일자',''))}")
-        if parsed.get("공포번호"):
-            info_lines.append(f"- 공포번호: {parsed.get('공포번호','')}")
-        if parsed.get("시행일자"):
-            info_lines.append(f"- 시행일자: {format_date(parsed.get('시행일자',''))}")
-        if parsed.get("소관부처"):
-            info_lines.append(f"- 소관부처: {parsed.get('소관부처','')}")
-        if parsed.get("부서명"):
-            info_lines.append(f"- 부서명: {parsed.get('부서명','')}")
-        if parsed.get("부서연락처"):
-            info_lines.append(f"- 부서연락처: {parsed.get('부서연락처','')}")
-    else:
-        if parsed.get("행정규칙ID"):
-            info_lines.append(f"- 행정규칙ID: {parsed.get('행정규칙ID','')}")
-        if parsed.get("행정규칙일련번호"):
-            info_lines.append(f"- 행정규칙일련번호: {parsed.get('행정규칙일련번호','')}")
-        if api_title:
-            info_lines.append(f"- 행정규칙명: {api_title}")
-        if parsed.get("행정규칙종류"):
-            info_lines.append(f"- 행정규칙종류: {parsed.get('행정규칙종류','')}")
-        if parsed.get("제개정구분명"):
-            info_lines.append(f"- 제개정구분명: {parsed.get('제개정구분명','')}")
-        if parsed.get("발령일자"):
-            info_lines.append(f"- 발령일자: {format_date(parsed.get('발령일자',''))}")
-        if parsed.get("발령번호"):
-            info_lines.append(f"- 발령번호: {parsed.get('발령번호','')}")
-        if parsed.get("시행일자"):
-            info_lines.append(f"- 시행일자: {format_date(parsed.get('시행일자',''))}")
-        if parsed.get("소관부처명"):
-            info_lines.append(f"- 소관부처명: {parsed.get('소관부처명','')}")
-        if parsed.get("담당부서기관명"):
-            info_lines.append(f"- 담당부서기관명: {parsed.get('담당부서기관명','')}")
-        if parsed.get("전화번호"):
-            info_lines.append(f"- 전화번호: {parsed.get('전화번호','')}")
-        if parsed.get("현행여부"):
-            info_lines.append(f"- 현행여부: {parsed.get('현행여부','')}")
-
-    parts.append("\n".join(info_lines))
-    parts.append("\n---\n")
 
     # 본문 (편/장/절/관 계층 감지 + 조 헤더 + 항/호/목 조판)
     # '## 본문' 래퍼 헤더는 두지 않는다 — 장(##)과 헤더 레벨이 겹치기 때문.
     articles = parsed.get("articles") or []
     flat_legal_rules = (
-        api_target == "admrul" and _uses_admrul_flat_legal_rules(title)
+        api_target == "admrul" and _uses_admrul_flat_legal_rules(parsed)
     )
     body_md = (
         render_law_body(articles, flat_legal_rules=flat_legal_rules)
@@ -1936,9 +2835,6 @@ def render_markdown(parsed: Dict[str, Any], api_target: str,
     # 별표 및 서식
     appendix_count = 0
     appendix_text_count = 0
-    pdf_link_count = 0
-    file_link_count = 0
-    image_link_count = 0
 
     parts.append("## 별표 및 서식")
     appendices = parsed.get("appendices") or []
@@ -1949,27 +2845,22 @@ def render_markdown(parsed: Dict[str, Any], api_target: str,
             parts.append("")
             appendix_count += 1
             appendix_text_count += c["text"]
-            pdf_link_count += c["pdf"]
-            file_link_count += c["file"]
-            image_link_count += c["image"]
     else:
         parts.append("> 별표 정보 없음")
     parts.append("\n---\n")
 
     # 첨부파일 (행정규칙)
-    attachment_count = 0
     attachments = parsed.get("attachments") or []
     if attachments:
         parts.append("## 첨부파일 링크")
         for att in attachments:
             name = normalize_dots((att.get("첨부파일명") or "").strip())
-            link = (att.get("첨부파일링크") or "").strip()
+            link = normalize_law_link(att.get("첨부파일링크") or "")
             if not (name or link):
                 continue
             parts.append(f"- 첨부파일명: {name}")
             if link:
                 parts.append(f"  - 첨부파일링크: {link}")
-            attachment_count += 1
         parts.append("\n---\n")
 
     # 개정문 / 제개정이유
@@ -1990,19 +2881,26 @@ def render_markdown(parsed: Dict[str, Any], api_target: str,
     parts.append(
         "- 이 문서는 법제처 Open API XML 응답을 NotebookLM 업로드용 Markdown으로 변환한 것이다.\n"
         "- 별표·서식 PDF/HWP/이미지 원본은 다운로드하지 않았으며, API의 별표내용을 본문에 통합하였다.\n"
-        "- 원문 파일 링크는 법제처 API 응답의 파일링크를 정규화하여 기록하였다."
+        "- 본문 이미지는 법제처 공식 원문 URL을 참조하는 Markdown 이미지와 확인 링크로 기록하였다.\n"
+        "- 원문 파일 링크는 법제처 API 응답의 파일링크를 정규화하여 기록하였다.\n"
+        + (
+            f"- 본문 문자는 검색용 병행 프로필 `{text_normalization}`로 정규화하였다."
+            if text_normalization != "none"
+            else "- 본문 문자는 API 원문의 유니코드 표기를 보존하였다."
+        )
     )
 
     md_text = "\n".join(parts).rstrip() + "\n"
 
+    link_stats = _document_link_stats(parsed)
     counts = {
         "article_count": len(articles),
         "appendix_count": appendix_count,
         "appendix_text_count": appendix_text_count,
-        "appendix_pdf_link_count": pdf_link_count,
-        "appendix_file_link_count": file_link_count,
-        "appendix_image_link_count": image_link_count,
-        "attachment_link_count": attachment_count,
+        **link_stats,
+        "thdcmp_referenced_article_count": 0,
+        "thdcmp_rendered_article_count": 0,
+        "thdcmp_duplicate_reference_count": 0,
     }
     return md_text, counts
 
@@ -2061,11 +2959,13 @@ def _thdcmp_title_with_label(prefix: str, jo: Dict[str, Any]) -> str:
     return base
 
 
-def _render_thdcmp_jo_header(jo: Dict[str, Any], kind: str) -> str:
-    """3단비교 조문 1건의 헤더 라인(### …)을 만든다."""
+def _render_thdcmp_jo_header(
+    jo: Dict[str, Any], kind: str, *, level: int = 3
+) -> str:
+    """3단비교 조문 1건을 지정한 연속 헤딩 레벨로 만든다."""
     label = _thdcmp_jo_label(jo.get("조번호", ""), jo.get("조가지번호", ""))
     title_inner = normalize_dots(_strip_jo_prefix_in_title(jo.get("조제목", "")))
-    header_bits: List[str] = [f"### {kind}"]
+    header_bits: List[str] = [f"{'#' * max(2, min(level, 6))} {kind}"]
     if label:
         header_bits.append(label)
     header = " ".join(header_bits)
@@ -2097,7 +2997,7 @@ def _render_flat_legal_body(text: str, *, strip_jo_prefix: bool = False) -> str:
     원문 내용은 유지한다. 조문 말미의 대괄호 단독 줄은 참고자료 인용문으로
     분리한다.
     """
-    content = normalize_dots((text or "").strip())
+    content = _normalize_legal_text((text or "").strip())
     if strip_jo_prefix:
         content = _JO_PREFIX_RE.sub("", content)
     if not content:
@@ -2156,20 +3056,23 @@ def _render_flat_legal_body(text: str, *, strip_jo_prefix: bool = False) -> str:
     return "\n".join(rendered)
 
 
-def render_thdcmp_markdown(parsed: Dict[str, Any], collected_at: str,
-                           requested_title: str) -> Tuple[str, Dict[str, int]]:
+def render_thdcmp_markdown(
+    parsed: Dict[str, Any],
+    collected_at: str,
+    requested_title: str,
+    provenance: Optional[SourceProvenance] = None,
+    text_normalization: str = "none",
+) -> Tuple[str, Dict[str, int]]:
     """3단비교(인용조문) Markdown 렌더링.
 
     구조:
       # {법령명} 인용조문 3단비교
-      ## 문서정보
-      ## 본문
-        ### 법률 제N조 (제목)
-        #### 인용조문: 시행령 제M조(...), 제M'조(...) / 시행규칙 제K조(...)
+        ## 법률 제N조 (제목)  # 장이 있으면 H3
+        **인용조문:** 시행령 제M조(...), 제M'조(...) / 시행규칙 제K조(...)
         법률 본문
-        ### 시행령 제M조 (제목)
+        ### 시행령 제M조 (제목)  # 장이 있으면 H4
         시행령 본문
-        ### 시행규칙 제K조 (제목)
+        ### 시행규칙 제K조 (제목)  # 장이 있으면 H4
         시행규칙 본문
 
     동일한 시행령/시행규칙 조문 본문은 한 번만 출력하고, 색인에는 모두 표시한다.
@@ -2177,55 +3080,64 @@ def render_thdcmp_markdown(parsed: Dict[str, Any], collected_at: str,
     api_title = parsed.get("법령명") or ""
     title = api_title or requested_title or "(제목 없음)"
 
-    parts: List[str] = [f"# {title} 인용조문 3단비교", ""]
-
-    parts.append("## 문서정보")
-    info: List[str] = [
-        "- 문서유형: 3단비교(인용조문, knd=1)",
-        "- API target: thdCmp",
-        f"- 조회명칭 LM: {requested_title}",
+    rendered_title = f"{title} 인용조문 3단비교"
+    parts: List[str] = [
+        _render_frontmatter(
+            parsed,
+            "thdCmp",
+            title=rendered_title,
+            requested_title=requested_title,
+            collected_at=collected_at,
+            provenance=provenance,
+            text_normalization=text_normalization,
+        ),
+        "",
+        f"# {rendered_title}",
+        "",
     ]
-    if api_title and api_title != requested_title:
-        info.append(f"- 응답 명칭(요청과 다름): {api_title}")
-    info.append(f"- 수집일시: {collected_at}")
-    if parsed.get("법령ID"):
-        info.append(f"- 법령ID: {parsed['법령ID']}")
-    if parsed.get("법령요약정보"):
-        info.append(f"- 법령요약정보: {parsed['법령요약정보']}")
-    if parsed.get("시행령ID") and parsed.get("시행령ID") != "0":
-        info.append(f"- 시행령ID: {parsed['시행령ID']}")
-        if parsed.get("시행령명"):
-            info.append(f"- 시행령명: {parsed['시행령명']}")
-        if parsed.get("시행령요약정보"):
-            info.append(f"- 시행령요약정보: {parsed['시행령요약정보']}")
-    if parsed.get("시행규칙ID") and parsed.get("시행규칙ID") != "0":
-        info.append(f"- 시행규칙ID: {parsed['시행규칙ID']}")
-        if parsed.get("시행규칙명"):
-            info.append(f"- 시행규칙명: {parsed['시행규칙명']}")
-        if parsed.get("시행규칙요약정보"):
-            info.append(f"- 시행규칙요약정보: {parsed['시행규칙요약정보']}")
-    if parsed.get("삼단비교기준"):
-        info.append(f"- 삼단비교기준: {parsed['삼단비교기준']}")
-    if parsed.get("삼단비교존재여부"):
-        info.append(f"- 삼단비교존재여부: {parsed['삼단비교존재여부']}")
-    parts.append("\n".join(info))
-    parts.append("\n---\n")
 
     # '## 본문' 래퍼 헤더는 두지 않는다 — 장(##)과 헤더 레벨이 겹치기 때문.
     articles: List[Dict[str, Any]] = parsed.get("articles") or []
+    reference_occurrence_count = sum(
+        len(article.get("시행령조문") or [])
+        + len(article.get("시행규칙조문") or [])
+        for article in articles
+    )
     seen_enf: set = set()
     seen_rule: set = set()
     article_count = 0
     enf_body_count = 0
     rule_body_count = 0
+    active_law_structures: List[str] = []
 
     for art in articles:
         조제목 = (art.get("조제목") or "").strip()
-        # 장(章) 헤더 같이 조제목이 없고 조내용이 짧은 경우는 그대로 출력
+        # 장·절 등 구조 블록은 실제 존재하는 상위 구조만 H2부터 압축한다.
         if not 조제목:
-            chapter = normalize_dots((art.get("조내용") or "").strip())
-            if chapter:
-                parts.append(f"## {chapter}")
+            structure_text = _normalize_legal_text(
+                (art.get("조내용") or "").strip()
+            )
+            if structure_text:
+                structure_match = _STRUCTURE_RE.match(structure_text)
+                structure_type = (
+                    structure_match.group(1) if structure_match else ""
+                )
+                if structure_type in _STRUCTURE_ORDER:
+                    rank = _STRUCTURE_ORDER[structure_type]
+                    active_law_structures = [
+                        existing for existing in active_law_structures
+                        if _STRUCTURE_ORDER[existing] < rank
+                    ]
+                    structure_level = min(
+                        2 + len(active_law_structures), 6
+                    )
+                    active_law_structures.append(structure_type)
+                    parts.append(
+                        f"{'#' * structure_level} {structure_text}"
+                    )
+                else:
+                    active_law_structures = []
+                    parts.append(f"## {structure_text}")
                 parts.append("")
             continue
 
@@ -2233,8 +3145,14 @@ def render_thdcmp_markdown(parsed: Dict[str, Any], collected_at: str,
         enf_list = art.get("시행령조문") or []
         rule_list = art.get("시행규칙조문") or []
 
-        # 법률 조문 헤더
-        parts.append(_render_thdcmp_jo_header(art, "법률"))
+        # 구조가 없으면 법률 조문을 H2, 장·절 아래에서는 한 단계씩 내린다.
+        law_heading_level = min(2 + len(active_law_structures), 6)
+        child_heading_level = min(law_heading_level + 1, 6)
+        parts.append(
+            _render_thdcmp_jo_header(
+                art, "법률", level=law_heading_level
+            )
+        )
 
         # 색인 라인 (헤더 바로 아래, 있을 때만): 첫 항목은 종류 prefix 포함
         index_groups: List[str] = []
@@ -2247,7 +3165,7 @@ def render_thdcmp_markdown(parsed: Dict[str, Any], collected_at: str,
             ]
             index_groups.append(", ".join(labels))
         if index_groups:
-            parts.append(f"#### 인용조문: {' / '.join(index_groups)}")
+            parts.append(f"**인용조문:** {' / '.join(index_groups)}")
 
         # 법률 본문
         law_body = _render_flat_legal_body(
@@ -2265,7 +3183,11 @@ def render_thdcmp_markdown(parsed: Dict[str, Any], collected_at: str,
             if key in seen_enf:
                 continue
             seen_enf.add(key)
-            parts.append(_render_thdcmp_jo_header(j, "시행령"))
+            parts.append(
+                _render_thdcmp_jo_header(
+                    j, "시행령", level=child_heading_level
+                )
+            )
             j_body = _render_flat_legal_body(
                 j.get("조내용") or "", strip_jo_prefix=True
             )
@@ -2281,7 +3203,11 @@ def render_thdcmp_markdown(parsed: Dict[str, Any], collected_at: str,
             if key in seen_rule:
                 continue
             seen_rule.add(key)
-            parts.append(_render_thdcmp_jo_header(j, "시행규칙"))
+            parts.append(
+                _render_thdcmp_jo_header(
+                    j, "시행규칙", level=child_heading_level
+                )
+            )
             j_body = _render_flat_legal_body(
                 j.get("조내용") or "", strip_jo_prefix=True
             )
@@ -2298,23 +3224,83 @@ def render_thdcmp_markdown(parsed: Dict[str, Any], collected_at: str,
     parts.append("## 수집 참고")
     parts.append(
         "- 이 문서는 법제처 Open API의 3단비교(인용조문, knd=1) XML 응답을 Markdown으로 변환한 것이다.\n"
-        "- 각 법률 조문 헤더 아래의 `#### 인용조문:` 라인은 해당 법률 조문이 인용하는 시행령/시행규칙 조문 색인이다.\n"
+        "- 각 법률 조문 헤더 아래의 `인용조문:` 강조문은 해당 법률 조문이 인용하는 시행령/시행규칙 조문 색인이다.\n"
         "- 동일한 시행령/시행규칙 조문은 처음 등장한 위치에서 한 번만 본문을 펼친다.\n"
-        "- 위임행정규칙(NFPC/NFTC) 목록은 본 문서의 범위에서 제외했다."
+        "- 위임행정규칙(NFPC/NFTC) 목록은 본 문서의 범위에서 제외했다.\n"
+        + (
+            f"- 본문 문자는 검색용 병행 프로필 `{text_normalization}`로 정규화하였다."
+            if text_normalization != "none"
+            else "- 본문 문자는 API 원문의 유니코드 표기를 보존하였다."
+        )
     )
 
     md_text = "\n".join(parts).rstrip() + "\n"
 
+    link_stats = _document_link_stats(parsed)
+    rendered_reference_count = enf_body_count + rule_body_count
     counts = {
         "article_count": article_count,
         "appendix_count": 0,
         "appendix_text_count": 0,
-        "appendix_pdf_link_count": 0,
-        "appendix_file_link_count": 0,
-        "appendix_image_link_count": 0,
-        "attachment_link_count": enf_body_count + rule_body_count,
+        **link_stats,
+        "thdcmp_referenced_article_count": reference_occurrence_count,
+        "thdcmp_rendered_article_count": rendered_reference_count,
+        "thdcmp_duplicate_reference_count": max(
+            reference_occurrence_count - rendered_reference_count, 0
+        ),
     }
     return md_text, counts
+
+
+def _render_prepared_document(
+    parsed: Dict[str, Any],
+    api_target: str,
+    collected_at: str,
+    requested_title: str,
+    provenance: Optional[SourceProvenance],
+    *,
+    text_normalization: str = "none",
+) -> Tuple[str, Dict[str, int]]:
+    if api_target == "thdCmp":
+        return render_thdcmp_markdown(
+            parsed,
+            collected_at,
+            requested_title,
+            provenance,
+            text_normalization,
+        )
+    return render_markdown(
+        parsed,
+        api_target,
+        collected_at,
+        requested_title,
+        provenance,
+        text_normalization,
+    )
+
+
+def render_document(
+    parsed: Dict[str, Any],
+    api_target: str,
+    collected_at: str,
+    requested_title: str,
+    provenance: Optional[SourceProvenance] = None,
+) -> Tuple[str, Dict[str, int], int]:
+    """원본 parsed를 건드리지 않고 기본 검색 정규화 Markdown을 렌더한다."""
+    normalized_parsed, change_count = normalize_parsed_for_search(parsed)
+    normalized_requested_title = normalize_search_text(requested_title)
+    change_count += _normalization_edit_count(
+        requested_title, normalized_requested_title
+    )
+    markdown, counts = _render_prepared_document(
+        normalized_parsed,
+        api_target,
+        collected_at,
+        normalized_requested_title,
+        provenance,
+        text_normalization=NORMALIZATION_PROFILE,
+    )
+    return markdown, counts, change_count
 
 
 # ---------------------------------------------------------------------------
@@ -2420,11 +3406,12 @@ class SingleRunLock:
 
 
 def _ensure_dirs() -> None:
-    for d in (
+    directories = [
         MD_LAW_DIR, MD_ADMRUL_DIR, MD_THDCMP_DIR,
         XML_LAW_DIR, XML_ADMRUL_DIR, XML_THDCMP_DIR,
         LOG_DIR,
-    ):
+    ]
+    for d in directories:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -2562,7 +3549,8 @@ def _main_locked(args: argparse.Namespace, run_id: str) -> int:
         source_index = idx
         title = (row.get("명칭", "") or "").strip()
         dtype = (row.get("문서유형", "") or "").strip()
-        collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        processed_at = _utc_now_iso()
+        collected_at = processed_at
 
         manifest = {
             "source_index": source_index,
@@ -2593,6 +3581,30 @@ def _main_locked(args: argparse.Namespace, run_id: str) -> int:
             "normalized_links_count": 0,
             "error_message": "",
             "collected_at": collected_at,
+            "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+            "renderer_version": RENDERER_VERSION,
+            "run_id": run_id,
+            "source_mode": "",
+            "source_retrieved_at": "",
+            "source_timestamp_basis": "",
+            "processed_at": processed_at,
+            "raw_xml_sha256": "",
+            "raw_xml_size_bytes": 0,
+            "markdown_sha256": "",
+            "markdown_size_bytes": 0,
+            "embedded_image_reference_count": 0,
+            "embedded_image_link_count": 0,
+            "unique_normalized_link_count": 0,
+            "duplicate_link_count": 0,
+            "invalid_link_count": 0,
+            "has_attachment_links": "N",
+            "has_any_links": "N",
+            "has_embedded_image_references": "N",
+            "thdcmp_referenced_article_count": 0,
+            "thdcmp_rendered_article_count": 0,
+            "thdcmp_duplicate_reference_count": 0,
+            "normalization_profile": NORMALIZATION_PROFILE,
+            "normalization_changed_field_count": 0,
         }
 
         # API URL 구성 (manifest 기록용 - 캐시 모드에서도 URL은 기록한다)
@@ -2653,8 +3665,11 @@ def _main_locked(args: argparse.Namespace, run_id: str) -> int:
         # 소스 결정: 캐시 vs HTTP fetch
         xml_text = ""
         xml_path: Optional[Path] = None
+        raw_bytes = b""
+        provenance: Optional[SourceProvenance] = None
         parsed: Optional[Dict[str, Any]] = None
         md_text: Optional[str] = None
+        normalization_change_count = 0
         counts: Optional[Dict[str, int]] = None
         http_status_for_failed: Any = ""
 
@@ -2671,8 +3686,17 @@ def _main_locked(args: argparse.Namespace, run_id: str) -> int:
         )
         if use_cache:
             try:
-                xml_text = cached_path.read_text(encoding="utf-8")
+                raw_bytes = cached_path.read_bytes()
+                xml_text = raw_bytes.decode("utf-8-sig")
                 xml_path = cached_path
+                processed_at = _utc_now_iso()
+                provenance = provenance_from_cache(
+                    cached_path,
+                    raw_bytes,
+                    processed_at,
+                    expected_api_target=api_target,
+                    expected_requested_title=title,
+                )
             except Exception as error:
                 error_message = safe_error_message(error)
                 fail += 1
@@ -2731,6 +3755,8 @@ def _main_locked(args: argparse.Namespace, run_id: str) -> int:
                 continue
 
             xml_text = result.xml_text
+            raw_bytes = xml_text.encode("utf-8")
+            source_retrieved_at = _utc_now_iso()
             try:
                 # 새 응답은 파싱·의미 검증을 통과해야만 기존 캐시를 교체한다.
                 parsed = parse_and_validate_xml(api_target, xml_text)
@@ -2756,16 +3782,25 @@ def _main_locked(args: argparse.Namespace, run_id: str) -> int:
                 )
                 continue
 
+            # 수신·파싱이 끝난 뒤 실제 Markdown 변환에 사용한 시각을 확정한다.
+            processed_at = _utc_now_iso()
+            provenance = SourceProvenance(
+                "API_FETCH",
+                source_retrieved_at,
+                "HTTP_FETCH",
+                processed_at,
+                _sha256_bytes(raw_bytes),
+                len(raw_bytes),
+            )
             try:
                 # 렌더링까지 메모리에서 성공한 응답만 캐시로 승격한다.
-                if api_target == "thdCmp":
-                    md_text, counts = render_thdcmp_markdown(
-                        parsed, collected_at, title
-                    )
-                else:
-                    md_text, counts = render_markdown(
-                        parsed, api_target, collected_at, title
-                    )
+                (
+                    md_text,
+                    counts,
+                    normalization_change_count,
+                ) = render_document(
+                    parsed, api_target, collected_at, title, provenance
+                )
                 if not md_text or not md_text.strip():
                     raise ValueError("Markdown 렌더링 결과가 비어 있습니다.")
             except Exception as error:
@@ -2793,11 +3828,26 @@ def _main_locked(args: argparse.Namespace, run_id: str) -> int:
 
             try:
                 xml_path = save_raw_xml(api_target, base_name, xml_text)
+                saved_raw_bytes = xml_path.read_bytes()
+                if (
+                    _sha256_bytes(saved_raw_bytes) != provenance.raw_xml_sha256
+                    or len(saved_raw_bytes) != provenance.raw_xml_size_bytes
+                ):
+                    raise OSError("저장된 원시 XML 바이트 검증 실패")
+                write_raw_metadata(
+                    xml_path,
+                    provenance,
+                    api_target=api_target,
+                    requested_title=title,
+                    api_url_without_oc=masked_url,
+                )
             except Exception as error:
                 error_message = safe_error_message(error)
                 fail += 1
                 manifest["status"] = "FAIL"
-                manifest["error_message"] = f"원시 XML 저장 실패: {error_message}"
+                manifest["error_message"] = (
+                    f"원시 XML/메타데이터 저장 실패: {error_message}"
+                )
                 manifest_rows.append(manifest)
                 failed_rows.append({
                     "source_index": source_index,
@@ -2805,17 +3855,33 @@ def _main_locked(args: argparse.Namespace, run_id: str) -> int:
                     "title": title,
                     "api_target": api_target,
                     "api_url_without_oc": masked_url,
+                    # 기존 소비자와의 호환을 위해 sidecar 저장 오류도 이 분류를 쓴다.
                     "error_type": "RAW_XML_WRITE_FAIL",
                     "error_message": error_message,
                     "http_status": http_status_for_failed,
                     "collected_at": collected_at,
                 })
                 logger.error(
-                    f"[FAIL] {source_index} {title}: 원시 XML 저장 실패 - "
-                    f"{error_message}"
+                    f"[FAIL] {source_index} {title}: "
+                    f"원시 XML/메타데이터 저장 실패 - {error_message}"
                 )
                 continue
             fetched += 1
+
+        if provenance is None:
+            # 모든 정상 소스 결정 경로는 provenance를 생성해야 한다.
+            raise RuntimeError("원문 provenance가 초기화되지 않았습니다.")
+
+        manifest["source_mode"] = provenance.source_mode
+        manifest["source_retrieved_at"] = _iso8601_with_offset(
+            provenance.source_retrieved_at
+        )
+        manifest["source_timestamp_basis"] = provenance.source_timestamp_basis
+        manifest["processed_at"] = _iso8601_with_offset(
+            provenance.processed_at
+        )
+        manifest["raw_xml_sha256"] = provenance.raw_xml_sha256
+        manifest["raw_xml_size_bytes"] = provenance.raw_xml_size_bytes
 
         if xml_path is not None:
             manifest["raw_xml_path"] = str(xml_path.relative_to(PROJECT_DIR)).replace("\\", "/")
@@ -2853,19 +3919,25 @@ def _main_locked(args: argparse.Namespace, run_id: str) -> int:
         # Markdown 렌더링
         try:
             if md_text is None or counts is None:
-                if api_target == "thdCmp":
-                    md_text, counts = render_thdcmp_markdown(
-                        parsed, collected_at, title
-                    )
-                else:
-                    md_text, counts = render_markdown(
-                        parsed, api_target, collected_at, title
-                    )
+                (
+                    md_text,
+                    counts,
+                    normalization_change_count,
+                ) = render_document(
+                    parsed, api_target, collected_at, title, provenance
+                )
             if not md_text or not md_text.strip():
                 raise ValueError("Markdown 렌더링 결과가 비어 있습니다.")
             md_path = write_markdown(api_target, md_base_name, md_text)
             if md_path.stat().st_size == 0:
                 raise ValueError("Markdown 파일이 0바이트")
+            markdown_bytes = md_path.read_bytes()
+            manifest["markdown_sha256"] = _sha256_bytes(markdown_bytes)
+            manifest["markdown_size_bytes"] = len(markdown_bytes)
+            manifest["normalization_profile"] = NORMALIZATION_PROFILE
+            manifest["normalization_changed_field_count"] = (
+                normalization_change_count
+            )
         except Exception as error:
             error_message = safe_error_message(error)
             error_type = (
@@ -2951,12 +4023,36 @@ def _main_locked(args: argparse.Namespace, run_id: str) -> int:
         manifest["has_pdf_links"] = "Y" if counts["appendix_pdf_link_count"] > 0 else "N"
         manifest["has_hwp_or_file_links"] = "Y" if counts["appendix_file_link_count"] > 0 else "N"
         manifest["has_image_links"] = "Y" if counts["appendix_image_link_count"] > 0 else "N"
-        manifest["normalized_links_count"] = (
-            counts["appendix_pdf_link_count"]
-            + counts["appendix_file_link_count"]
-            + counts["appendix_image_link_count"]
-            + counts["attachment_link_count"]
+        manifest["normalized_links_count"] = counts["normalized_links_count"]
+        manifest["embedded_image_reference_count"] = counts[
+            "embedded_image_reference_count"
+        ]
+        manifest["embedded_image_link_count"] = counts[
+            "embedded_image_link_count"
+        ]
+        manifest["unique_normalized_link_count"] = counts[
+            "unique_normalized_link_count"
+        ]
+        manifest["duplicate_link_count"] = counts["duplicate_link_count"]
+        manifest["invalid_link_count"] = counts["invalid_link_count"]
+        manifest["has_attachment_links"] = (
+            "Y" if counts["attachment_link_count"] > 0 else "N"
         )
+        manifest["has_any_links"] = (
+            "Y" if counts["normalized_links_count"] > 0 else "N"
+        )
+        manifest["has_embedded_image_references"] = (
+            "Y" if counts["embedded_image_reference_count"] > 0 else "N"
+        )
+        manifest["thdcmp_referenced_article_count"] = counts[
+            "thdcmp_referenced_article_count"
+        ]
+        manifest["thdcmp_rendered_article_count"] = counts[
+            "thdcmp_rendered_article_count"
+        ]
+        manifest["thdcmp_duplicate_reference_count"] = counts[
+            "thdcmp_duplicate_reference_count"
+        ]
 
         if counts["appendix_text_count"] > 0:
             has_appendix_text_docs += 1
@@ -3010,6 +4106,7 @@ def _main_locked(args: argparse.Namespace, run_id: str) -> int:
         f"manifest: {MANIFEST_CSV}\n"
         f"failed_items: {FAILED_CSV}\n"
         f"markdown: {MD_LAW_DIR} / {MD_ADMRUL_DIR} / {MD_THDCMP_DIR}\n"
+        f"정규화 프로필: {NORMALIZATION_PROFILE}\n"
         f"raw_xml: {XML_LAW_DIR} / {XML_ADMRUL_DIR} / {XML_THDCMP_DIR}\n"
         "====================="
     )
@@ -3020,6 +4117,7 @@ def _main_locked(args: argparse.Namespace, run_id: str) -> int:
         f"  소스 | 캐시 {cache_used} | API {fetched}\n"
         f"  유형 | 법령 {law_success} | 행정규칙 {admrul_success} | 3단비교 {thdcmp_success}\n"
         f"  결과표 | {MANIFEST_CSV.relative_to(PROJECT_DIR)}\n"
+        f"  정규화 | {NORMALIZATION_PROFILE}\n"
         f"  상세 로그 | {log_path.relative_to(PROJECT_DIR)}"
     )
     tqdm.write(console_summary, file=sys.stderr)

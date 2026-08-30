@@ -8,7 +8,7 @@ import pytest
 import collect_law_markdown as collector
 
 
-FIXED_TIME = "2026-08-30 12:34:56"
+FIXED_TIME = "2026-08-30T03:34:56Z"
 
 
 @pytest.mark.parametrize(
@@ -29,10 +29,10 @@ FIXED_TIME = "2026-08-30 12:34:56"
             collector.parse_law_xml,
             "테스트 법률",
             "000001",
-            "7ebd96f4f518ab705f52e107c7f93ae46592c86197f8f4f7799bf6331f1ec88c",
+            "e119e617526eb28b61ece06a40bc67d717bb1dcd0fc003503ef0aa204aec148d",
             (
                 "# 테스트 법률",
-                "##### 제1조 (목적)",
+                "## 제1조 (목적)",
                 "**1** 첫 번째 항이다.",
                 "### 부칙 1",
                 "### [별표 1] 시험표",
@@ -46,6 +46,15 @@ FIXED_TIME = "2026-08-30 12:34:56"
                 "appendix_file_link_count": 1,
                 "appendix_image_link_count": 1,
                 "attachment_link_count": 0,
+                "embedded_image_reference_count": 1,
+                "embedded_image_link_count": 1,
+                "normalized_links_count": 4,
+                "unique_normalized_link_count": 4,
+                "duplicate_link_count": 0,
+                "invalid_link_count": 0,
+                "thdcmp_referenced_article_count": 0,
+                "thdcmp_rendered_article_count": 0,
+                "thdcmp_duplicate_reference_count": 0,
             },
         ),
         (
@@ -54,10 +63,10 @@ FIXED_TIME = "2026-08-30 12:34:56"
             collector.parse_admrul_xml,
             "테스트 행정규칙",
             "90001",
-            "b91ba1879382cbef3b5ef0e62ce91d85b1ec1a44c67acad0d9989c13bdc8fa5b",
+            "b6b622faa154ee635cc83a6eeae9c19e492f01eb97948a7839b0e606726932cc",
             (
                 "# 테스트 행정규칙",
-                "##### 제1조 (목적)",
+                "## 제1조 (목적)",
                 "### [서식 1] 행정 서식",
                 "## 첨부파일 링크",
                 "https://www.law.go.kr/LSW/attach.pdf",
@@ -70,6 +79,15 @@ FIXED_TIME = "2026-08-30 12:34:56"
                 "appendix_file_link_count": 0,
                 "appendix_image_link_count": 0,
                 "attachment_link_count": 1,
+                "embedded_image_reference_count": 0,
+                "embedded_image_link_count": 0,
+                "normalized_links_count": 1,
+                "unique_normalized_link_count": 1,
+                "duplicate_link_count": 0,
+                "invalid_link_count": 0,
+                "thdcmp_referenced_article_count": 0,
+                "thdcmp_rendered_article_count": 0,
+                "thdcmp_duplicate_reference_count": 0,
             },
         ),
     ],
@@ -93,8 +111,8 @@ def test_law_and_admrul_parse_and_render_golden_sections(
     assert validated == parsed
     assert collector._law_id(parsed) == expected_id
 
-    markdown, actual_counts = collector.render_markdown(
-        parsed, api_target, FIXED_TIME, title
+    markdown, actual_counts, _ = collector.render_document(
+        parsed, api_target, FIXED_TIME, title, None
     )
     assert actual_counts == counts
     assert sha256(markdown.encode("utf-8")).hexdigest() == golden_sha256
@@ -113,8 +131,8 @@ def test_thdcmp_parse_and_render_golden_sections(fixture_text) -> None:
     assert len(parsed["articles"][0]["시행령조문"]) == 1
     assert len(parsed["articles"][0]["시행규칙조문"]) == 1
 
-    markdown, counts = collector.render_thdcmp_markdown(
-        parsed, FIXED_TIME, "테스트 법률"
+    markdown, counts, _ = collector.render_document(
+        parsed, "thdCmp", FIXED_TIME, "테스트 법률", None
     )
     assert counts == {
         "article_count": 1,
@@ -123,14 +141,23 @@ def test_thdcmp_parse_and_render_golden_sections(fixture_text) -> None:
         "appendix_pdf_link_count": 0,
         "appendix_file_link_count": 0,
         "appendix_image_link_count": 0,
-        "attachment_link_count": 2,
+        "attachment_link_count": 0,
+        "embedded_image_reference_count": 0,
+        "embedded_image_link_count": 0,
+        "normalized_links_count": 0,
+        "unique_normalized_link_count": 0,
+        "duplicate_link_count": 0,
+        "invalid_link_count": 0,
+        "thdcmp_referenced_article_count": 2,
+        "thdcmp_rendered_article_count": 2,
+        "thdcmp_duplicate_reference_count": 0,
     }
     assert sha256(markdown.encode("utf-8")).hexdigest() == (
-        "1e0024c20b97d1d68ae6aeacf8e82c3f42a6bc90d17aeea3d0e56cb3bd14590e"
+        "9e5cfa4e99bdcfa9142523c0e9b1006a83767922713636b30501582cff8aaa00"
     )
     assert "# 테스트 법률 인용조문 3단비교" in markdown
-    assert "### 법률 제1조 (목적)" in markdown
-    assert "#### 인용조문: 시행령 제2조(위임) / 시행규칙 제3조(서식)" in markdown
+    assert "## 법률 제1조 (목적)" in markdown
+    assert "**인용조문:** 시행령 제2조(위임) / 시행규칙 제3조(서식)" in markdown
     assert "### 시행령 제2조 (위임)" in markdown
     assert "### 시행규칙 제3조 (서식)" in markdown
 
@@ -153,7 +180,8 @@ def test_appendix_cdata_addendum_and_revision_markdown_are_protected(fixture_tex
     assert "\\`원문 코드\\`" in markdown
     assert "1\\. 이 법은 공포한 날부터 시행한다." in markdown
     assert "- 이 하이픈은 원문이다." in markdown
-    assert "이미지 참조(ID: 77)" in markdown
+    assert "![법령정보센터 원문 이미지 77]" in markdown
+    assert "https://www.law.go.kr/flDownload.do?flSeq=77" in markdown
 
 
 @pytest.mark.parametrize(
