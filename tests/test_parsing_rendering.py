@@ -215,13 +215,28 @@ def test_appendix_cdata_addendum_and_revision_markdown_are_protected(fixture_tex
         ),
     ],
 )
+@pytest.mark.parametrize("use_lxml", [True, False])
 def test_strict_xml_validation_rejects_bad_responses(
-    api_target: str, xml_text: str, message: str
+    api_target: str, xml_text: str, message: str, use_lxml: bool, monkeypatch
 ) -> None:
+    monkeypatch.setattr(collector, "_HAS_LXML", use_lxml)
     # lxml raises XMLSyntaxError for malformed input while semantic failures use
     # ValueError. Both are strict rejection; no recovery result may escape.
-    with pytest.raises(Exception, match=message):
+    with pytest.raises(Exception, match=message + "|no element found"):
         collector.parse_and_validate_xml(api_target, xml_text)
+
+
+@pytest.mark.parametrize(
+    ("api_target", "fixture_name"),
+    [("law", "law.xml"), ("admrul", "admrul.xml"), ("thdCmp", "thdcmp.xml")],
+)
+def test_defusedxml_fallback_matches_lxml_parsing(
+    api_target, fixture_name, fixture_text, monkeypatch
+) -> None:
+    xml_text = fixture_text(fixture_name)
+    expected = collector.parse_and_validate_xml(api_target, xml_text)
+    monkeypatch.setattr(collector, "_HAS_LXML", False)
+    assert collector.parse_and_validate_xml(api_target, xml_text) == expected
 
 
 @pytest.mark.parametrize(

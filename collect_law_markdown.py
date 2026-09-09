@@ -85,7 +85,7 @@ except Exception:
     LET = None  # type: ignore
     _HAS_LXML = False
 
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
 
 
 # ---------------------------------------------------------------------------
@@ -965,8 +965,9 @@ def parse_xml_root(xml_text: str):
         if root is None:
             raise ValueError("XML 파싱 실패(lxml): root 없음")
         return root
-    parser = ET.XMLParser()
-    return ET.fromstring(xml_text, parser=parser)
+    return ET.fromstring(
+        xml_text, forbid_dtd=True, forbid_entities=True, forbid_external=True
+    )
 
 
 def _validate_root_for_target(root, api_target: str) -> None:
