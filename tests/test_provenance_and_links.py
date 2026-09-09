@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from copy import deepcopy
 from datetime import datetime
 from hashlib import sha256
 import json
@@ -467,12 +468,13 @@ def test_thdcmp_referenced_articles_are_not_reported_as_attachment_links(
     assert row["thdcmp_duplicate_reference_count"] == "0"
 
 
+@pytest.mark.parametrize("child_kind", ["시행령조문", "시행규칙조문"])
 def test_thdcmp_reference_occurrences_are_separate_from_deduplicated_rendering(
-    fixture_text,
+    fixture_text, child_kind,
 ) -> None:
     parsed = collector.parse_thdcmp_xml(fixture_text("thdcmp.xml"))
-    duplicate = dict(parsed["articles"][0]["시행령조문"][0])
-    parsed["articles"][0]["시행령조문"].append(duplicate)
+    duplicate = dict(parsed["articles"][0][child_kind][0])
+    parsed["articles"][0][child_kind].append(duplicate)
 
     markdown, counts = collector.render_thdcmp_markdown(
         parsed, "2026-08-30 12:34:56", "테스트 법률"
@@ -482,6 +484,42 @@ def test_thdcmp_reference_occurrences_are_separate_from_deduplicated_rendering(
     assert counts["thdcmp_rendered_article_count"] == 2
     assert counts["thdcmp_duplicate_reference_count"] == 1
     assert markdown.count("### 시행령 제") == 1
+    assert markdown.count("### 시행규칙 제") == 1
+
+
+def test_thdcmp_repeated_references_render_under_each_parent_law_article(
+    fixture_text,
+) -> None:
+    parsed = collector.parse_thdcmp_xml(fixture_text("thdcmp.xml"))
+    first = parsed["articles"][0]
+    # Earlier articles and article 50 can cite the same decree and rule.
+    repeated = deepcopy(first)
+    repeated.update({
+        "조번호": "0050",
+        "조제목": "제50조(권한 또는 업무의 위임·위탁 등)",
+        "조내용": "제50조(권한 또는 업무의 위임·위탁 등) 위탁한다.",
+    })
+    for kind in ("시행령조문", "시행규칙조문"):
+        repeated[kind].append(dict(repeated[kind][0]))
+    following = {
+        "조번호": "0051", "조제목": "제51조(벌칙)",
+        "조내용": "제51조(벌칙) 처벌한다.",
+    }
+    parsed["articles"].extend([repeated, following])
+
+    markdown, counts = collector.render_thdcmp_markdown(
+        parsed, "2026-08-30 12:34:56", "테스트 법률"
+    )
+
+    first_section, repeated_section = markdown.split("## 법률 제50조", 1)
+    repeated_section = repeated_section.split("## 법률 제51조", 1)[0]
+    for section in (first_section, repeated_section):
+        assert section.count("### 시행령 제2조 (위임)") == 1
+        assert section.count("### 시행규칙 제3조 (서식)") == 1
+        assert section.index("시행령 본문이다.") < section.index("시행규칙 본문이다.")
+    assert counts["thdcmp_referenced_article_count"] == 6
+    assert counts["thdcmp_rendered_article_count"] == 4
+    assert counts["thdcmp_duplicate_reference_count"] == 2
 
 
 def test_link_normalization_rejects_malformed_urls_and_drops_upgraded_default_port(

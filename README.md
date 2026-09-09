@@ -247,7 +247,7 @@ Markdown에 적용한 정규화 프로필과 변경된 텍스트 필드 수만 �
 | 파일 무결성 | `raw_xml_sha256`, `raw_xml_size_bytes`, `markdown_sha256`, `markdown_size_bytes` | 매니페스트가 가리키는 XML·Markdown의 실제 바이트와 해시를 검증합니다. |
 | 링크 품질 | `normalized_links_count`, `unique_normalized_link_count`, `duplicate_link_count`, `invalid_link_count`, `has_attachment_links`, `has_any_links` | 유효 링크 발생 수, 정규화 후 고유 수, 중복·무효 수와 링크 보유 여부를 구분합니다. |
 | 본문 이미지 | `embedded_image_reference_count`, `embedded_image_link_count`, `has_embedded_image_references` | XML 본문 안의 이미지 참조와 유효한 `src` 또는 숫자 `id`에서 복원한 원문 링크를 별표 이미지 링크와 분리해 셉니다. |
-| 3단비교 | `thdcmp_referenced_article_count`, `thdcmp_rendered_article_count`, `thdcmp_duplicate_reference_count` | XML에 나타난 시행령·시행규칙 참조 발생 수, 중복 제거 후 실제 렌더 수, 그 차이를 구분합니다. 참조 조문은 첨부파일 링크가 아닙니다. |
+| 3단비교 | `thdcmp_referenced_article_count`, `thdcmp_rendered_article_count`, `thdcmp_duplicate_reference_count` | XML에 나타난 시행령·시행규칙 참조 발생 수, 각 법률 조문 안의 중복 제거 후 실제 렌더 수, 그 차이를 구분합니다. 다른 법률 조문에서 다시 인용하면 본문도 다시 출력합니다. 참조 조문은 첨부파일 링크가 아닙니다. |
 | 검색 정규화 | `normalization_profile`, `normalization_changed_field_count` | 단일 Markdown에 항상 적용한 프로필과 실제로 달라진 텍스트 필드 수를 기록합니다. |
 
 `source_mode=API_FETCH`인 신규 수집은 `source_retrieved_at`과 `source_timestamp_basis=HTTP_FETCH`를 기록합니다. 검증된 sidecar를 사용한 캐시 재생은 원래 수신시각을 유지하고 `source_timestamp_basis=CACHE_METADATA`로 표시합니다. sidecar가 없는 legacy cache는 `source_retrieved_at`을 비워 두고 `UNKNOWN_LEGACY_CACHE`로 표시합니다.

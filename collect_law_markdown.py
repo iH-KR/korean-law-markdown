@@ -3075,7 +3075,8 @@ def render_thdcmp_markdown(
         ### 시행규칙 제K조 (제목)  # 장이 있으면 H4
         시행규칙 본문
 
-    동일한 시행령/시행규칙 조문 본문은 한 번만 출력하고, 색인에는 모두 표시한다.
+    각 법률 조문 아래에 인용된 시행령/시행규칙 본문을 출력한다.
+    동일 법률 조문 안의 중복 참조만 한 번으로 합치고, 색인에는 모두 표시한다.
     """
     api_title = parsed.get("법령명") or ""
     title = api_title or requested_title or "(제목 없음)"
@@ -3103,8 +3104,6 @@ def render_thdcmp_markdown(
         + len(article.get("시행규칙조문") or [])
         for article in articles
     )
-    seen_enf: set = set()
-    seen_rule: set = set()
     article_count = 0
     enf_body_count = 0
     rule_body_count = 0
@@ -3144,6 +3143,9 @@ def render_thdcmp_markdown(
         article_count += 1
         enf_list = art.get("시행령조문") or []
         rule_list = art.get("시행규칙조문") or []
+        # 다른 법률 조문에서 이미 출력한 인용조문도 현재 조문 아래에 펼친다.
+        seen_enf: set = set()
+        seen_rule: set = set()
 
         # 구조가 없으면 법률 조문을 H2, 장·절 아래에서는 한 단계씩 내린다.
         law_heading_level = min(2 + len(active_law_structures), 6)
@@ -3225,7 +3227,7 @@ def render_thdcmp_markdown(
     parts.append(
         "- 이 문서는 법제처 Open API의 3단비교(인용조문, knd=1) XML 응답을 Markdown으로 변환한 것이다.\n"
         "- 각 법률 조문 헤더 아래의 `인용조문:` 강조문은 해당 법률 조문이 인용하는 시행령/시행규칙 조문 색인이다.\n"
-        "- 동일한 시행령/시행규칙 조문은 처음 등장한 위치에서 한 번만 본문을 펼친다.\n"
+        "- 인용된 시행령/시행규칙 본문은 각 법률 조문 아래에 펼치며, 같은 법률 조문 안의 중복 참조만 한 번으로 합친다.\n"
         "- 위임행정규칙(NFPC/NFTC) 목록은 본 문서의 범위에서 제외했다.\n"
         + (
             f"- 본문 문자는 검색용 병행 프로필 `{text_normalization}`로 정규화하였다."

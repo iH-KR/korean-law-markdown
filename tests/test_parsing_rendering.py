@@ -153,7 +153,7 @@ def test_thdcmp_parse_and_render_golden_sections(fixture_text) -> None:
         "thdcmp_duplicate_reference_count": 0,
     }
     assert sha256(markdown.encode("utf-8")).hexdigest() == (
-        "9e5cfa4e99bdcfa9142523c0e9b1006a83767922713636b30501582cff8aaa00"
+        "b66369a96da8d99c897cfee878cd060f29d69ad0086a97e1764662b53a4d3508"
     )
     assert "# 테스트 법률 인용조문 3단비교" in markdown
     assert "## 법률 제1조 (목적)" in markdown
