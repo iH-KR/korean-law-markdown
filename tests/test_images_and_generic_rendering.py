@@ -389,8 +389,8 @@ def test_xml_format_flag_enables_flat_legal_rendering_for_arbitrary_title(
     assert "## 제1조 (목적)" in markdown
     assert "**①** 첫째 항" in markdown
     assert "  1\\. 첫째 호" in markdown
-    assert "    가\\. 첫째 목" in markdown
-    assert "      1\\) 하위 항목" in markdown
+    assert "&#32;   가\\. 첫째 목" in markdown
+    assert "&#32;     1\\) 하위 항목" in markdown
 
 
 def test_missing_format_flag_uses_strict_article_structure_fallback() -> None:

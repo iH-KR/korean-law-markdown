@@ -132,7 +132,7 @@ def _fail_on_network(*_args, **_kwargs):
 
 def test_manifest_schema_appends_new_columns_without_reordering_legacy_prefix() -> None:
     assert collector.MANIFEST_SCHEMA_VERSION == "4"
-    assert collector.RENDERER_VERSION == "4.0"
+    assert collector.RENDERER_VERSION == "4.1"
     assert tuple(collector.MANIFEST_COLUMNS[: len(LEGACY_MANIFEST_PREFIX)]) == (
         LEGACY_MANIFEST_PREFIX
     )
@@ -168,7 +168,7 @@ def test_fresh_fetch_writes_verified_provenance_sidecar_and_cache_replay_preserv
     assert collector.main(["--input", str(source)]) == 0
     fetched_row = _manifest_row()
     assert fetched_row["manifest_schema_version"] == "4"
-    assert fetched_row["renderer_version"] == "4.0"
+    assert fetched_row["renderer_version"] == "4.1"
     assert fetched_row["run_id"]
     assert fetched_row["source_mode"] == "API_FETCH"
     assert fetched_row["source_timestamp_basis"] == "HTTP_FETCH"

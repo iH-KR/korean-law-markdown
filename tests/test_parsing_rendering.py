@@ -29,7 +29,7 @@ FIXED_TIME = "2026-08-30T03:34:56Z"
             collector.parse_law_xml,
             "테스트 법률",
             "000001",
-            "e119e617526eb28b61ece06a40bc67d717bb1dcd0fc003503ef0aa204aec148d",
+            "800579d58104deae249c5209fcd7c765156d9c0455e800ab8582abb2fc56c9ca",
             (
                 "# 테스트 법률",
                 "## 제1조 (목적)",
@@ -63,7 +63,7 @@ FIXED_TIME = "2026-08-30T03:34:56Z"
             collector.parse_admrul_xml,
             "테스트 행정규칙",
             "90001",
-            "b6b622faa154ee635cc83a6eeae9c19e492f01eb97948a7839b0e606726932cc",
+            "9747ead80ede39629ecc9fa19d7017350caef125f771ccdb102bd1ffdc3b40fd",
             (
                 "# 테스트 행정규칙",
                 "## 제1조 (목적)",
@@ -153,7 +153,7 @@ def test_thdcmp_parse_and_render_golden_sections(fixture_text) -> None:
         "thdcmp_duplicate_reference_count": 0,
     }
     assert sha256(markdown.encode("utf-8")).hexdigest() == (
-        "b66369a96da8d99c897cfee878cd060f29d69ad0086a97e1764662b53a4d3508"
+        "93415431032c13e9325f30b338154c76358e937bf81165aac3b9c3d433b49225"
     )
     assert "# 테스트 법률 인용조문 3단비교" in markdown
     assert "## 법률 제1조 (목적)" in markdown

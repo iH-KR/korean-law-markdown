@@ -217,7 +217,7 @@ def test_frontmatter_is_safe_typed_and_preserves_leading_zero_ids(
     assert metadata["텍스트정규화"] == collector.NORMALIZATION_PROFILE
     assert metadata["원문SHA-256"] == "a" * 64
     assert metadata["조회명칭"] == collector.normalize_search_text(title)
-    assert metadata["변환기버전"] == "4.0"
+    assert metadata["변환기버전"] == "4.1"
     assert {
         "frontmatter_schema_version",
         "title",

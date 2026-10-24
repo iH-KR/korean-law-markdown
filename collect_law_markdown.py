@@ -117,7 +117,7 @@ RETRY_STATUSES = {429, 500, 502, 503, 504}
 RETRY_DELAYS = [2, 5, 10]
 MAX_FILENAME_LEN = 150
 MANIFEST_SCHEMA_VERSION = "4"
-RENDERER_VERSION = "4.0"
+RENDERER_VERSION = "4.1"
 FRONTMATTER_SCHEMA_VERSION = "2"
 NORMALIZATION_PROFILE = "NFKC_SEARCH_V1"
 RAW_METADATA_SCHEMA_VERSION = 1
@@ -1814,12 +1814,7 @@ def normalize_parsed_for_search(
 
 
 def normalize_appendix_blank_lines(text: str) -> str:
-    """별표·서식 본문의 불필요한 빈 행을 보수적으로 축소한다.
-
-    내용 행 사이의 빈 행이 1개면 제거하고, 2개 이상 연속되면 1개만
-    남긴다. 내용이 있는 행의 문자, 순서, 행 내부 공백은 변경하지 않는다.
-    법령과 행정규칙의 모든 별표 구분에 공통 적용한다.
-    """
+    """별표·서식의 기존 문단 경계를 살리고 연속된 빈 행만 1개로 줄인다."""
     if not text:
         return ""
 
@@ -1837,7 +1832,7 @@ def normalize_appendix_blank_lines(text: str) -> str:
         while run_end < len(lines) and not lines[run_end].strip():
             run_end += 1
 
-        if run_end - index >= 2:
+        if normalized and run_end < len(lines):
             normalized.append("")
         index = run_end
 
@@ -1928,6 +1923,83 @@ def neutralize_appendix_markdown(text: str) -> str:
         neutralized.append(line)
 
     return _restore_embedded_images("\n".join(neutralized), embedded_images)
+
+
+_APPENDIX_PARAGRAPH_START_RE = re.compile(
+    r"^[ \t]*(?:"
+    r"(?:\d+(?:의\d+)?|[가-힣])[.)](?!\d)"
+    r"|\((?:\d+|[가-힣])\)"
+    rf"|[{_CIRCLED_LEGAL_MARKERS}※■□○]"
+    r"|비고(?=[ \t:：]|$))"
+)
+_APPENDIX_BOX_DRAWING_RE = re.compile(r"[\u2500-\u257f]")
+
+
+def render_appendix_content(text: str) -> str:
+    """텍스트 열거와 선 문자로 그린 표를 구분해 별표·서식을 렌더한다.
+
+    텍스트의 번호별 문단 및 원문 행 경계는 보존한다. 표·서식의 선 문자가
+    있는 연속 행은 고정폭 텍스트로 보존하며, 셀 병합이나 단어 경계를
+    추정하지 않는다. 표 안의 이미지는 참조 위치와 표 밖의 링크를 함께 둔다.
+    """
+    if not text or not text.strip():
+        return ""
+    protected, images = _hold_embedded_images(text)
+    source = normalize_appendix_blank_lines(protected)
+    blocks: List[str] = []
+    prose: List[str] = []
+    layout: List[str] = []
+
+    def flush_prose() -> None:
+        if not prose:
+            return
+        paragraphs: List[str] = []
+        for line in prose:
+            if (
+                line.strip() and paragraphs and paragraphs[-1].strip()
+                and _APPENDIX_PARAGRAPH_START_RE.match(line)
+            ):
+                paragraphs.append("")
+            paragraphs.append(line.rstrip(" \t"))
+        safe = neutralize_appendix_markdown("\n".join(paragraphs).strip("\n"))
+        safe_lines = safe.split("\n")
+        # 단일 줄바꿈의 softbreak 병합을 막고 원문 행 경계를 명시한다.
+        for i in range(len(safe_lines) - 1):
+            if safe_lines[i].strip() and safe_lines[i + 1].strip():
+                safe_lines[i] += "  "
+        if safe.strip():
+            blocks.append("\n".join(safe_lines))
+        prose.clear()
+
+    def flush_layout() -> None:
+        if not layout:
+            return
+        raw = "\n".join(layout)
+        references: List[str] = []
+        for i, (token, _) in enumerate(images, start=1):
+            if token in raw:
+                raw = raw.replace(token, f"[원문 이미지 {i}]")
+                references.append(token)
+        # 원문 안의 백틱이 생성한 코드 블록을 닫지 못하도록 fence 길이를 정한다.
+        longest_backticks = max((len(m.group()) for m in re.finditer(r"`+", raw)), default=0)
+        fence = "`" * max(3, longest_backticks + 1)
+        blocks.append(f"{fence}text\n{raw}\n{fence}")
+        blocks.extend(references)
+        layout.clear()
+
+    for line in source.split("\n"):
+        if _APPENDIX_BOX_DRAWING_RE.search(line):
+            flush_prose()
+            layout.append(line)
+        elif not line.strip() and layout:
+            # API가 표의 각 행 사이에 삽입한 빈 행은 셀 내용이 아니다.
+            continue
+        else:
+            flush_layout()
+            prose.append(line)
+    flush_layout()
+    flush_prose()
+    return _restore_embedded_images("\n\n".join(blocks), images)
 
 
 def _embedded_image_attributes(attributes: str) -> Dict[str, str]:
@@ -2271,6 +2343,22 @@ def _neutralize_mok_child_ordered_lists(text: str) -> str:
     )
 
 
+def _append_legal_paragraph(lines: List[str], text: str) -> None:
+    """법적 열거를 독립 문단으로 출력해 뷰어의 softbreak 병합을 막는다.
+
+    원문 안의 하위 열거 행도 분리한다. 문단 시작의 4칸 이상 들여쓰기는
+    첫 공백을 엔터티로 보존해 Markdown 코드블록으로 해석되지 않게 한다.
+    """
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if lines and lines[-1]:
+            lines.append("")
+        if re.match(r"^(?: {4,}|\t)", line):
+            line = ("&#9;" if line.startswith("\t") else "&#32;") + line[1:]
+        lines.extend([line, ""])
+
+
 def _render_article_reference_lines(reference: str) -> List[str]:
     """여러 줄의 조문참고자료를 하나의 Markdown 인용문으로 렌더한다.
 
@@ -2342,6 +2430,7 @@ def _render_law_article_lines(
       조판하고, 목내용의 줄 시작 'N)'도 'N\\)'로 바꾸어 Markdown 자동
       순서목록화를 방지한다.
     - 원문 점 문자를 보존하고, 호/목 라인은 수평 공백을 단일화한다.
+      호/목과 하위 열거 행은 각각 독립 문단으로 출력한다.
     - 조문참고자료는 인용문으로 보존한다(데이터 유실 방지).
     - flat_legal_rules=True이면 XML 구조 없이 조문내용에 포함된 항ㆍ호ㆍ목
       표지도 같은 규칙으로 조판한다.
@@ -2445,9 +2534,9 @@ def _render_law_article_lines(
             if sub_content:
                 s = _normalize_ws_inline(_HO_PREFIX_RE.sub("", sub_content.strip()))
                 if sub_num:
-                    lines.append(f"  {sub_num}\\. {s}")
+                    _append_legal_paragraph(lines, f"  {sub_num}\\. {s}")
                 else:
-                    lines.append(f"  {s}")
+                    _append_legal_paragraph(lines, f"  {s}")
 
             for item in subpara.get("목") or []:
                 item_num = (item.get("목번호") or "").strip().rstrip(".")
@@ -2459,12 +2548,9 @@ def _render_law_article_lines(
                     s = _normalize_ws_inline(_MOK_PREFIX_RE.sub("", item_content.strip()))
                     s = _neutralize_mok_child_ordered_lists(s)
                     if item_num:
-                        lines.append(f"    {item_num}\\. {s}")
+                        _append_legal_paragraph(lines, f"    {item_num}\\. {s}")
                     else:
-                        lines.append(f"    {s}")
-
-        if para.get("호"):
-            lines.append("")
+                        _append_legal_paragraph(lines, f"    {s}")
 
     ref_lines = _render_article_reference_lines(art.get("조문참고자료") or "")
     if ref_lines:
@@ -2524,10 +2610,8 @@ def _render_appendix(ap: Dict[str, Any], idx_fallback: int) -> Tuple[str, Dict[s
     제목 = normalize_dots((ap.get("별표제목") or "").strip())
     구분 = ap.get("별표구분", "")
     시행일 = format_date(ap.get("별표시행일자", ""))
-    내용 = neutralize_appendix_markdown(
-        normalize_appendix_blank_lines(
-            normalize_dots((ap.get("별표내용") or "").strip())
-        )
+    내용 = render_appendix_content(
+        normalize_dots((ap.get("별표내용") or "").strip())
     )
 
     label_no = f"{번호}{('-' + 가지) if 가지 and 가지 != '0' else ''}" or str(idx_fallback)
@@ -3029,32 +3113,32 @@ def _render_flat_legal_body(text: str, *, strip_jo_prefix: bool = False) -> str:
     for line in body_lines:
         match = _FLAT_LEGAL_HANG_LINE_RE.match(line)
         if match:
-            rendered.append(f"**{match.group(1)}** {match.group(2).strip()}")
+            _append_legal_paragraph(rendered, f"**{match.group(1)}** {match.group(2).strip()}")
             continue
 
         match = _FLAT_LEGAL_HO_LINE_RE.match(line)
         if match:
-            rendered.append(f"  {match.group(1)}\\. {match.group(2).strip()}")
+            _append_legal_paragraph(rendered, f"  {match.group(1)}\\. {match.group(2).strip()}")
             continue
 
         match = _FLAT_LEGAL_MOK_LINE_RE.match(line)
         if match:
-            rendered.append(f"    {match.group(1)}\\. {match.group(2).strip()}")
+            _append_legal_paragraph(rendered, f"    {match.group(1)}\\. {match.group(2).strip()}")
             continue
 
         match = _FLAT_LEGAL_MOK_CHILD_LINE_RE.match(line)
         if match:
-            rendered.append(f"      {match.group(1)}\\) {match.group(2).strip()}")
+            _append_legal_paragraph(rendered, f"      {match.group(1)}\\) {match.group(2).strip()}")
             continue
 
         rendered.append(line)
 
     if reference_lines:
-        if rendered:
+        if rendered and rendered[-1]:
             rendered.append("")
         rendered.extend(_render_article_reference_lines("\n".join(reference_lines)))
 
-    return "\n".join(rendered)
+    return "\n".join(rendered).rstrip()
 
 
 def render_thdcmp_markdown(
